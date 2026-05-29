@@ -1,0 +1,83 @@
+apiVersion: v1
+kind: Pod
+metadata:
+    name: gpu-pod-runc
+    labels:
+        app: qwen-vllm
+        bench: seccomp
+        #seccomp: unconfined
+        # seccomp: runtime-default
+
+spec:
+    runtimeClassName: nvidia
+    restartPolicy: Never
+
+    # 固定到目标 GPU node，避免 A/B 跑到不同机器
+    nodeName: server
+    # 或者用 nodeSelector:
+    # nodeSelector:
+    #   kubernetes.io/hostname: <你的GPU节点名>
+
+    securityContext:
+        seccompProfile:
+            type: Unconfined
+            # type: RuntimeDefault
+
+    containers:
+        - name: cuda-container
+          image: docker.io/vllm/vllm-openai:v0.20.1-cu129-ubuntu2404
+          env:
+          - name: CUDA_VISIBLE_DEVICES
+            value: "3"
+          command:
+              - bash
+              - -lc
+              - |
+                  echo "=== preflight ==="
+                  hostname
+                  cat /proc/self/status | grep -E 'Cpus_allowed_list|Mems_allowed_list|Seccomp'
+                  cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || true
+                  cat /sys/fs/cgroup/cpuset.mems.effective 2>/dev/null || true
+                  nvidia-smi -L
+                  echo "=== start vLLM ==="
+                  exec vllm serve /model \
+                    --tensor-parallel-size 1 \
+                    --host 0.0.0.0 \
+                    --port 8000 \
+                    --max-num-batched-tokens 8192 \
+                    --max-model-len 8192
+
+          resources:
+              requests:
+                  cpu: "16"
+                  memory: "64Gi"
+                #   nvidia.com/gpu: "1"
+              limits:
+                  cpu: "16"
+                  memory: "64Gi"
+                #   nvidia.com/gpu: "1"
+
+          ports:
+              - containerPort: 8000
+
+          volumeMounts:
+              - name: model-volume
+                mountPath: /model
+                readOnly: true
+              - name: trace-volume
+                mountPath: /traces
+
+    volumes:
+        - name: model-volume
+          hostPath:
+              path: /home/liulei/models/Qwen/Qwen3___5-9B
+              type: Directory
+        - name: trace-volume
+          hostPath:
+              path: /data/home/liulei/TcProject/ctr-container/traces
+              type: DirectoryOrCreate
+
+    tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule

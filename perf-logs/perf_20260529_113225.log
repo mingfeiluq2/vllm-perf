@@ -1,0 +1,21 @@
+
+--- perf stat ---
+
+ Performance counter stats for 'system wide':
+
+    29,267,343,777      cycles                           /kubepods.slice/kubepods-pod58943356_6809_48f9_a5ea_f3d1c292f8ce.slice                                      
+    58,263,298,949      instructions                     /kubepods.slice/kubepods-pod58943356_6809_48f9_a5ea_f3d1c292f8ce.slice #    1.99  insn per cycle            
+       194,899,652      cache-references                 /kubepods.slice/kubepods-pod58943356_6809_48f9_a5ea_f3d1c292f8ce.slice                                      
+        55,808,829      cache-misses                     /kubepods.slice/kubepods-pod58943356_6809_48f9_a5ea_f3d1c292f8ce.slice #   28.63% of all cache refs         
+       187,587,503      branch-misses                    /kubepods.slice/kubepods-pod58943356_6809_48f9_a5ea_f3d1c292f8ce.slice                                      
+               451      context-switches                 /kubepods.slice/kubepods-pod58943356_6809_48f9_a5ea_f3d1c292f8ce.slice                                      
+                15      cpu-migrations                   /kubepods.slice/kubepods-pod58943356_6809_48f9_a5ea_f3d1c292f8ce.slice                                      
+           205,205      page-faults                      /kubepods.slice/kubepods-pod58943356_6809_48f9_a5ea_f3d1c292f8ce.slice                                      
+
+      30.029900714 seconds time elapsed
+
+
+==> Fri May 29 11:33:08 AM CST 2026 测量完成
+    日志已保存到: /data/home/liulei/TcProject/k8s_deploy/kata-pgpu/vllm-perf/perf-logs/perf_20260529_113225.log
+==> 清理 Pod: gpu-pod-runc
+pod "gpu-pod-runc" deleted from default namespace
