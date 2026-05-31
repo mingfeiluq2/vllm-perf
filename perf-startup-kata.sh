@@ -5,16 +5,16 @@ set -euo pipefail
 # 配置
 # ============================================================
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-POD_YAML="${SCRIPT_DIR}/gpu-pod-runc.yaml"
-POD_NAME="gpu-pod-runc"
+POD_YAML="${SCRIPT_DIR}/gpu-pod-kata.yaml"
+POD_NAME="gpu-pod-kata"
 CONTAINER_NAME=${CONTAINER_NAME:-cuda-container}
 PERF_MODE=${PERF_MODE:-record}
 LOG_DIR="${SCRIPT_DIR}/perf-logs"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-LOG_FILE="${LOG_DIR}/perf_startup_runc_${TIMESTAMP}.log"
-STAT_OUTPUT="${LOG_DIR}/perf_startup_runc_stat_${TIMESTAMP}.txt"
-RECORD_FILE="${LOG_DIR}/perf_startup_runc_record_${TIMESTAMP}.data"
-VLLM_LOG="${LOG_DIR}/vllm_startup_runc_${TIMESTAMP}.log"
+LOG_FILE="${LOG_DIR}/perf_startup_kata_${TIMESTAMP}.log"
+STAT_OUTPUT="${LOG_DIR}/perf_startup_kata_stat_${TIMESTAMP}.txt"
+RECORD_FILE="${LOG_DIR}/perf_startup_kata_record_${TIMESTAMP}.data"
+VLLM_LOG="${LOG_DIR}/vllm_startup_kata_${TIMESTAMP}.log"
 CGROUP_ROOT=${CGROUP_ROOT:-/sys/fs/cgroup}
 STARTUP_TIMEOUT=${STARTUP_TIMEOUT:-600}
 KEEP_POD=${KEEP_POD:-0}
@@ -364,6 +364,8 @@ start_perf_stat() {
 
 start_perf_record() {
     echo "--- 启动 perf record ---"
+    sudo sysctl kernel.kptr_restrict=0
+    sudo sysctl kernel.perf_event_paranoid=1
     sudo perf record \
         -a -g \
         -e cycles \
@@ -438,7 +440,7 @@ echo "  2. Scheduler 绑定:            ${SUB2_TIME}s  Pod visible -> spec.nodeN
 echo ""
 echo "--- Node / Runtime 阶段 ---"
 echo "  3. 节点侧 Pod 启动总耗时:      ${SUB3_TIME}s  Scheduled -> Pod Running"
-echo "     3.1 Scheduled -> Pulled:    ${SUB3_1_TIME}s  kubelet 接收、CreatePodSandbox、runC、CNI、镜像检查"
+echo "     3.1 Scheduled -> Pulled:    ${SUB3_1_TIME}s  kubelet 接收、CreatePodSandbox、Kata VM、CNI、镜像检查"
 echo "     3.2 Pulled -> Created:      ${SUB3_2_TIME}s  CreateContainer"
 echo "     3.3 Created -> Started:     ${SUB3_3_TIME}s  StartContainer"
 echo "     3.4 Started -> Running:     ${SUB3_4_TIME}s  kubelet 状态上报 / Pod phase 更新"
@@ -482,7 +484,13 @@ fi
 echo "--- 输出文件 ---"
 echo "  完整日志:   ${LOG_FILE}"
 echo "  启动日志:   ${VLLM_LOG}"
-echo "  perf stat:  ${STAT_OUTPUT}"
-echo "  perf record: ${RECORD_FILE}"
+if [ "${PERF_MODE}" = "stat" ] || [ "${PERF_MODE}" = "all" ]; then
+    echo "  perf stat:  ${STAT_OUTPUT}"
+fi
+if [ "${PERF_MODE}" = "record" ] || [ "${PERF_MODE}" = "all" ]; then
+    echo "  perf record: ${RECORD_FILE}"
+else
+    echo "  perf record: 未启用（使用 PERF_MODE=record 或 PERF_MODE=all 生成 .data）"
+fi
 echo ""
 echo "==> $(date) 测量完成"
