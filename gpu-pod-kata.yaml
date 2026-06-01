@@ -8,6 +8,9 @@ metadata:
     #prometheus.io/scrape: "true"
     #prometheus.io/port: "8000" # 与暴露的端口一致（fastapi监听的）
     #prometheus.io/path: "/metrics"
+    annotations:
+      io.katacontainers.config.hypervisor.default_vcpus: "16"
+      io.katacontainers.config.hypervisor.default_memory: "65536"
 
 spec:
     runtimeClassName: kata-qemu-nvidia-gpu
