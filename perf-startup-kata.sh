@@ -17,6 +17,7 @@ RECORD_FILE="${LOG_DIR}/perf_startup_kata_record_${TIMESTAMP}.data"
 VLLM_LOG="${LOG_DIR}/vllm_startup_kata_${TIMESTAMP}.log"
 CGROUP_ROOT=${CGROUP_ROOT:-/sys/fs/cgroup}
 STARTUP_TIMEOUT=${STARTUP_TIMEOUT:-600}
+EXIT_AFTER_CONTAINER_STARTED=${EXIT_AFTER_CONTAINER_STARTED:-0}
 KEEP_POD=${KEEP_POD:-0}
 KEEP_POD_ON_ERROR=${KEEP_POD_ON_ERROR:-1}
 MAIN_LOG_PID=""
@@ -80,6 +81,45 @@ duration_between() {
             printf "%.2f", end - start
         }
     }'
+}
+
+format_duration() {
+    local value="$1"
+
+    if [ -z "${value}" ] || [ "${value}" = "N/A" ]; then
+        printf "N/A"
+    else
+        printf "%ss" "${value}"
+    fi
+}
+
+print_timing_summary() {
+    local sub3_desc="${SUB3_DESC:-Scheduled -> Pod Running}"
+    local sub4_desc="${SUB4_DESC:-Pod Running -> /health OK}"
+
+    echo ""
+    echo "============================================================"
+    echo "==> 启动耗时分解"
+    echo "============================================================"
+    echo ""
+    echo "--- API / Scheduler 阶段 ---"
+    printf "  1. Pod 对象创建:              %-8s kubectl apply -> Pod visible\n" "$(format_duration "${SUB1_TIME:-N/A}")"
+    printf "  2. Scheduler 绑定:            %-8s Pod visible -> spec.nodeName/Scheduled\n" "$(format_duration "${SUB2_TIME:-N/A}")"
+    echo ""
+    echo "--- Node / Runtime 阶段 ---"
+    printf "  3. 节点侧 Pod 启动总耗时:      %-8s %s\n" "$(format_duration "${SUB3_TIME:-N/A}")" "${sub3_desc}"
+    printf "     3.1 Scheduled -> Pulled:    %-8s kubelet 接收、CreatePodSandbox、Kata VM、CNI、镜像检查\n" "$(format_duration "${SUB3_1_TIME:-N/A}")"
+    printf "     3.2 Pulled -> Created:      %-8s CreateContainer\n" "$(format_duration "${SUB3_2_TIME:-N/A}")"
+    printf "     3.3 Created -> Started:     %-8s StartContainer\n" "$(format_duration "${SUB3_3_TIME:-N/A}")"
+    printf "     3.4 Started -> Running:     %-8s kubelet 状态上报 / Pod phase 更新\n" "$(format_duration "${SUB3_4_TIME:-N/A}")"
+    echo ""
+    echo "--- App 阶段 ---"
+    printf "  4. vLLM 就绪:                 %-8s %s\n" "$(format_duration "${SUB4_TIME:-N/A}")" "${sub4_desc}"
+    echo ""
+    echo "--- 总计 ---"
+    printf "  总启动时间:       %s\n" "$(format_duration "${TOTAL_TIME:-N/A}")"
+    printf "  K8s+Runtime:      %s\n" "$(format_duration "${K8S_TOTAL:-N/A}")"
+    echo ""
 }
 
 stop_perf() {
@@ -173,38 +213,64 @@ mkdir -p "${LOG_DIR}"
 echo "==> $(date) 开始 vLLM 启动性能测量"
 echo "    Pod: ${POD_NAME}"
 echo "    Perf 模式: ${PERF_MODE}"
+echo "    容器 Started 后退出: ${EXIT_AFTER_CONTAINER_STARTED}"
 echo "    日志文件: ${LOG_FILE}"
 echo ""
 
+# 验证 EXIT_AFTER_CONTAINER_STARTED
+case "${EXIT_AFTER_CONTAINER_STARTED}" in
+    0|1) ;;
+    *) echo "错误: 无效的 EXIT_AFTER_CONTAINER_STARTED '${EXIT_AFTER_CONTAINER_STARTED}'，可选: 0 / 1"; exit 1 ;;
+esac
+
+# 验证 PERF_MODE
+case "${PERF_MODE}" in
+    stat|record|all)
+        PERF_ENABLED=1
+        ;;
+    none)
+        PERF_ENABLED=0
+        ;;
+    *) echo "错误: 无效的 PERF_MODE '${PERF_MODE}'，可选: stat / record / all / none"; exit 1 ;;
+esac
+
+if [ "${EXIT_AFTER_CONTAINER_STARTED}" = "1" ]; then
+    PERF_ENABLED=0
+fi
+
 # 检查依赖
-for cmd in kubectl curl perf sudo; do
+REQUIRED_CMDS="kubectl"
+if [ "${EXIT_AFTER_CONTAINER_STARTED}" = "0" ]; then
+    REQUIRED_CMDS="${REQUIRED_CMDS} curl"
+fi
+if [ "${PERF_ENABLED}" = "1" ]; then
+    REQUIRED_CMDS="${REQUIRED_CMDS} perf sudo"
+fi
+
+for cmd in ${REQUIRED_CMDS}; do
     if ! command -v $cmd &>/dev/null; then
         echo "错误: 缺少依赖命令 '$cmd'"
         exit 1
     fi
 done
 
-# 检查 sudo 无密码访问
-if ! sudo -n true 2>/dev/null; then
-    echo "错误: sudo 需要无密码访问（用于 perf）"
-    exit 1
-fi
+if [ "${PERF_ENABLED}" = "1" ]; then
+    # 检查 sudo 无密码访问
+    if ! sudo -n true 2>/dev/null; then
+        echo "错误: sudo 需要无密码访问（用于 perf）"
+        exit 1
+    fi
 
-# 验证 PERF_MODE
-case "${PERF_MODE}" in
-    stat|record|all) ;;
-    *) echo "错误: 无效的 PERF_MODE '${PERF_MODE}'，可选: stat / record / all"; exit 1 ;;
-esac
+    # 检查 cgroup v2
+    if [ ! -f "${CGROUP_ROOT}/cgroup.controllers" ]; then
+        echo "错误: ${CGROUP_ROOT} 不是 cgroup v2 根目录"
+        exit 1
+    fi
 
-# 检查 cgroup v2
-if [ ! -f "${CGROUP_ROOT}/cgroup.controllers" ]; then
-    echo "错误: ${CGROUP_ROOT} 不是 cgroup v2 根目录"
-    exit 1
-fi
-
-# 检查 perf 权限
-if ! perf stat true 2>/dev/null; then
-    echo "提示: perf 可能权限不足，请以 root 运行或调整 /proc/sys/kernel/perf_event_paranoid"
+    # 检查 perf 权限
+    if ! perf stat true 2>/dev/null; then
+        echo "提示: perf 可能权限不足，请以 root 运行或调整 /proc/sys/kernel/perf_event_paranoid"
+    fi
 fi
 
 # 输出到 stdout + 日志文件
@@ -275,6 +341,33 @@ T_CONTAINER_STARTED=""
 echo -n "==> [3] 等待节点侧 Pod 启动"
 for i in $(seq 1 300); do
     poll_runtime_events
+    if [ "${EXIT_AFTER_CONTAINER_STARTED}" = "1" ] && [ -n "${T_CONTAINER_STARTED}" ]; then
+        SUB3_TIME=$(duration_between "${T_SCHEDULED}" "${T_CONTAINER_STARTED}")
+        K8S_TOTAL=$(duration_between "${T_APPLY}" "${T_CONTAINER_STARTED}")
+        SUB3_1_TIME=$(duration_between "${T_SCHEDULED}" "${T_PULLED}")
+        SUB3_2_TIME=$(duration_between "${T_PULLED}" "${T_CONTAINER_CREATED}")
+        SUB3_3_TIME=$(duration_between "${T_CONTAINER_CREATED}" "${T_CONTAINER_STARTED}")
+        SUB3_4_TIME="N/A"
+        SUB4_TIME="N/A"
+        TOTAL_TIME="${K8S_TOTAL}"
+        SUB3_DESC="Scheduled -> container Started"
+        SUB4_DESC="未测量（EXIT_AFTER_CONTAINER_STARTED=1）"
+
+        echo ""
+        echo "    容器已 Started: $(format_duration "${SUB3_TIME}")"
+        echo "==> EXIT_AFTER_CONTAINER_STARTED=1，跳过 perf、日志捕获、Pod IP 获取和 vLLM ready 检测"
+
+        print_timing_summary
+
+        echo "--- 输出文件 ---"
+        echo "  完整日志:   ${LOG_FILE}"
+        echo "  启动日志:   未启用（EXIT_AFTER_CONTAINER_STARTED=1）"
+        echo "  perf:        未启用（EXIT_AFTER_CONTAINER_STARTED=1）"
+        echo ""
+        echo "==> $(date) 测量完成"
+        exit 0
+    fi
+
     status=$(kubectl get pod "${POD_NAME}" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Pending")
     if [ "$status" = "Running" ]; then
         T_RUNNING=$(now_sec)
@@ -285,7 +378,11 @@ for i in $(seq 1 300); do
     fi
     if [ "$i" -eq 300 ]; then
         echo ""
-        echo "错误: Pod 在 300s 内未进入 Running，当前状态: ${status}"
+        if [ "${EXIT_AFTER_CONTAINER_STARTED}" = "1" ]; then
+            echo "错误: 容器在 300s 内未出现 Started 事件，当前 Pod 状态: ${status}"
+        else
+            echo "错误: Pod 在 300s 内未进入 Running，当前状态: ${status}"
+        fi
         kubectl describe pod "${POD_NAME}" 2>/dev/null || true
         exit 1
     fi
@@ -303,18 +400,22 @@ SUB3_4_TIME=$(duration_between "${T_CONTAINER_STARTED}" "${T_RUNNING}")
 # 阶段 2 准备: 获取 cgroup、Pod IP、启动日志
 # ============================================================
 echo ""
-echo "==> 定位 Pod cgroup"
-QOS_CLASS=$(kubectl get pod "${POD_NAME}" -o jsonpath='{.status.qosClass}' 2>/dev/null || true)
-if [ -z "${POD_UID}" ] || [ -z "${QOS_CLASS}" ]; then
-    echo "错误: 无法获取 Pod UID/QoS，请检查 Pod 是否存在: ${POD_NAME}"
-    exit 1
-fi
+if [ "${PERF_ENABLED}" = "1" ]; then
+    echo "==> 定位 Pod cgroup"
+    QOS_CLASS=$(kubectl get pod "${POD_NAME}" -o jsonpath='{.status.qosClass}' 2>/dev/null || true)
+    if [ -z "${POD_UID}" ] || [ -z "${QOS_CLASS}" ]; then
+        echo "错误: 无法获取 Pod UID/QoS，请检查 Pod 是否存在: ${POD_NAME}"
+        exit 1
+    fi
 
-CGROUP_PATH=$(get_pod_cgroup_path "${POD_UID}" "${QOS_CLASS}")
-CGROUP_FULL="${CGROUP_ROOT}${CGROUP_PATH}"
-echo "    Pod UID: ${POD_UID}"
-echo "    QoS: ${QOS_CLASS}"
-echo "    cgroup 路径: ${CGROUP_PATH}"
+    CGROUP_PATH=$(get_pod_cgroup_path "${POD_UID}" "${QOS_CLASS}")
+    CGROUP_FULL="${CGROUP_ROOT}${CGROUP_PATH}"
+    echo "    Pod UID: ${POD_UID}"
+    echo "    QoS: ${QOS_CLASS}"
+    echo "    cgroup 路径: ${CGROUP_PATH}"
+else
+    echo "==> 跳过 Pod cgroup 定位: PERF_MODE=none"
+fi
 
 echo "==> 获取 Pod IP"
 POD_IP=$(kubectl get pod "${POD_NAME}" -o jsonpath='{.status.podIP}' 2>/dev/null)
@@ -324,11 +425,13 @@ if [ -z "${POD_IP}" ]; then
 fi
 echo "    Pod IP: ${POD_IP}"
 
-if [ ! -d "${CGROUP_FULL}" ]; then
-    echo "错误: cgroup 路径不存在: ${CGROUP_FULL}"
-    exit 1
+if [ "${PERF_ENABLED}" = "1" ]; then
+    if [ ! -d "${CGROUP_FULL}" ]; then
+        echo "错误: cgroup 路径不存在: ${CGROUP_FULL}"
+        exit 1
+    fi
+    echo "    cgroup 路径已验证: ${CGROUP_FULL}"
 fi
-echo "    cgroup 路径已验证: ${CGROUP_FULL}"
 
 echo "==> 启动 vLLM 日志捕获"
 kubectl logs -f "${POD_NAME}" -c "${CONTAINER_NAME}" > "${VLLM_LOG}" 2>&1 &
@@ -340,10 +443,15 @@ echo "    日志文件: ${VLLM_LOG}"
 # 阶段 2: 启动 perf 并按模式选择 stat / record
 # ============================================================
 echo ""
-echo "==> 启动 perf 测量"
-echo "    模式: ${PERF_MODE}"
-echo "    注意: perf 测量起点为 cgroup 解析完成后，K8s 调度阶段不在覆盖范围"
-echo ""
+if [ "${PERF_ENABLED}" = "1" ]; then
+    echo "==> 启动 perf 测量"
+    echo "    模式: ${PERF_MODE}"
+    echo "    注意: perf 测量起点为 cgroup 解析完成后，K8s 调度阶段不在覆盖范围"
+    echo ""
+else
+    echo "==> 跳过 perf 测量: PERF_MODE=none"
+    echo ""
+fi
 
 start_perf_stat() {
     echo "--- 启动 perf stat ---"
@@ -391,6 +499,8 @@ case "${PERF_MODE}" in
         start_perf_stat
         start_perf_record
         ;;
+    none)
+        ;;
 esac
 
 # ============================================================
@@ -423,35 +533,17 @@ SUB4_TIME=$(elapsed_since "${T_RUNNING}")
 TOTAL_TIME=$(elapsed_since "${T_APPLY}")
 
 echo ""
-echo "==> 停止 perf 测量"
-stop_perf
+if [ "${PERF_ENABLED}" = "1" ]; then
+    echo "==> 停止 perf 测量"
+    stop_perf
+else
+    echo "==> 跳过停止 perf 测量: PERF_MODE=none"
+fi
 
 # 停止日志捕获
 [ -n "${MAIN_LOG_PID}" ] && kill "${MAIN_LOG_PID}" 2>/dev/null || true
 
-echo ""
-echo "============================================================"
-echo "==> 启动耗时分解"
-echo "============================================================"
-echo ""
-echo "--- API / Scheduler 阶段 ---"
-echo "  1. Pod 对象创建:              ${SUB1_TIME}s  kubectl apply -> Pod visible"
-echo "  2. Scheduler 绑定:            ${SUB2_TIME}s  Pod visible -> spec.nodeName/Scheduled"
-echo ""
-echo "--- Node / Runtime 阶段 ---"
-echo "  3. 节点侧 Pod 启动总耗时:      ${SUB3_TIME}s  Scheduled -> Pod Running"
-echo "     3.1 Scheduled -> Pulled:    ${SUB3_1_TIME}s  kubelet 接收、CreatePodSandbox、Kata VM、CNI、镜像检查"
-echo "     3.2 Pulled -> Created:      ${SUB3_2_TIME}s  CreateContainer"
-echo "     3.3 Created -> Started:     ${SUB3_3_TIME}s  StartContainer"
-echo "     3.4 Started -> Running:     ${SUB3_4_TIME}s  kubelet 状态上报 / Pod phase 更新"
-echo ""
-echo "--- App 阶段 ---"
-echo "  4. vLLM 就绪:                 ${SUB4_TIME}s  Pod Running -> /health OK"
-echo ""
-echo "--- 总计 ---"
-echo "  总启动时间:       ${TOTAL_TIME}s"
-echo "  K8s+Runtime:      ${K8S_TOTAL}s"
-echo ""
+print_timing_summary
 
 # perf stat 结果
 if [ "${PERF_MODE}" = "stat" ] || [ "${PERF_MODE}" = "all" ]; then
@@ -489,8 +581,10 @@ if [ "${PERF_MODE}" = "stat" ] || [ "${PERF_MODE}" = "all" ]; then
 fi
 if [ "${PERF_MODE}" = "record" ] || [ "${PERF_MODE}" = "all" ]; then
     echo "  perf record: ${RECORD_FILE}"
-else
+elif [ "${PERF_MODE}" = "stat" ]; then
     echo "  perf record: 未启用（使用 PERF_MODE=record 或 PERF_MODE=all 生成 .data）"
+else
+    echo "  perf:        未启用（PERF_MODE=none）"
 fi
 echo ""
 echo "==> $(date) 测量完成"

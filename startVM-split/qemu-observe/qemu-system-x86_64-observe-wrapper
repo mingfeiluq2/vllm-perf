@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# REAL_QEMU="/opt/kata/bin/qemu-system-x86_64"
+REAL_QEMU="/usr/bin/qemu-system-x86_64"
+STRACE="/usr/bin/strace"
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STRACE_FILTER_FILE="${BASE_DIR}/qemu-strace-filter"
+TRACE_EVENTS="${BASE_DIR}/qemu-trace-events"
+LOG_DIR="${BASE_DIR}/qemu-observe-logs"
+RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
+STRACE_LOG="${LOG_DIR}/qemu-strace-${RUN_ID}.log"
+QEMU_TRACE_LOG="${LOG_DIR}/qemu-trace-${RUN_ID}.log"
+
+if [[ ! -x "$STRACE" ]]; then
+  echo "ERROR: strace not found or not executable: $STRACE" >&2
+  exit 1
+fi
+
+if [[ ! -x "$REAL_QEMU" ]]; then
+  echo "ERROR: real QEMU not found or not executable: $REAL_QEMU" >&2
+  exit 1
+fi
+
+if [[ ! -f "$STRACE_FILTER_FILE" ]]; then
+  echo "ERROR: strace filter file not found: $STRACE_FILTER_FILE" >&2
+  exit 1
+fi
+
+if [[ ! -f "$TRACE_EVENTS" ]]; then
+  echo "ERROR: QEMU trace events file not found: $TRACE_EVENTS" >&2
+  exit 1
+fi
+
+STRACE_TRACE="$(
+  sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$STRACE_FILTER_FILE" | head -n 1
+)"
+
+if [[ -z "$STRACE_TRACE" ]]; then
+  echo "ERROR: no valid strace trace filter found in: $STRACE_FILTER_FILE" >&2
+  exit 1
+fi
+
+mkdir -p "$LOG_DIR"
+
+exec "$STRACE" \
+  -f \
+  -ttt \
+  -T \
+  -yy \
+  -s 256 \
+  -e "trace=${STRACE_TRACE}" \
+  -o "$STRACE_LOG" \
+  "$REAL_QEMU" \
+  -trace "events=${TRACE_EVENTS},file=${QEMU_TRACE_LOG}" \
+  -msg timestamp=on \
+  "$@"

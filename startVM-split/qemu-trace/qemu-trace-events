@@ -1,0 +1,12 @@
+vfio_listener_region_add_ram
+vfio_listener_region_add_iommu
+vfio_listener_region_add_no_dma_map
+vfio_device_get
+vfio_region_setup
+vfio_listener_region_del
+vfio_listener_region_del_iommu
+vfio_region_mmap
+vfio_region_unmap
+vfio_region_sparse_mmap_header
+vfio_region_sparse_mmap_entry
+vfio_region_mmaps_set_enabled

@@ -176,35 +176,47 @@ echo "    Perf 模式: ${PERF_MODE}"
 echo "    日志文件: ${LOG_FILE}"
 echo ""
 
+# 验证 PERF_MODE
+case "${PERF_MODE}" in
+    stat|record|all)
+        PERF_ENABLED=1
+        ;;
+    none)
+        PERF_ENABLED=0
+        ;;
+    *) echo "错误: 无效的 PERF_MODE '${PERF_MODE}'，可选: stat / record / all / none"; exit 1 ;;
+esac
+
 # 检查依赖
-for cmd in kubectl curl perf sudo; do
+REQUIRED_CMDS="kubectl curl"
+if [ "${PERF_ENABLED}" = "1" ]; then
+    REQUIRED_CMDS="${REQUIRED_CMDS} perf sudo"
+fi
+
+for cmd in ${REQUIRED_CMDS}; do
     if ! command -v $cmd &>/dev/null; then
         echo "错误: 缺少依赖命令 '$cmd'"
         exit 1
     fi
 done
 
-# 检查 sudo 无密码访问
-if ! sudo -n true 2>/dev/null; then
-    echo "错误: sudo 需要无密码访问（用于 perf）"
-    exit 1
-fi
+if [ "${PERF_ENABLED}" = "1" ]; then
+    # 检查 sudo 无密码访问
+    if ! sudo -n true 2>/dev/null; then
+        echo "错误: sudo 需要无密码访问（用于 perf）"
+        exit 1
+    fi
 
-# 验证 PERF_MODE
-case "${PERF_MODE}" in
-    stat|record|all) ;;
-    *) echo "错误: 无效的 PERF_MODE '${PERF_MODE}'，可选: stat / record / all"; exit 1 ;;
-esac
+    # 检查 cgroup v2
+    if [ ! -f "${CGROUP_ROOT}/cgroup.controllers" ]; then
+        echo "错误: ${CGROUP_ROOT} 不是 cgroup v2 根目录"
+        exit 1
+    fi
 
-# 检查 cgroup v2
-if [ ! -f "${CGROUP_ROOT}/cgroup.controllers" ]; then
-    echo "错误: ${CGROUP_ROOT} 不是 cgroup v2 根目录"
-    exit 1
-fi
-
-# 检查 perf 权限
-if ! perf stat true 2>/dev/null; then
-    echo "提示: perf 可能权限不足，请以 root 运行或调整 /proc/sys/kernel/perf_event_paranoid"
+    # 检查 perf 权限
+    if ! perf stat true 2>/dev/null; then
+        echo "提示: perf 可能权限不足，请以 root 运行或调整 /proc/sys/kernel/perf_event_paranoid"
+    fi
 fi
 
 # 输出到 stdout + 日志文件
@@ -303,18 +315,22 @@ SUB3_4_TIME=$(duration_between "${T_CONTAINER_STARTED}" "${T_RUNNING}")
 # 阶段 2 准备: 获取 cgroup、Pod IP、启动日志
 # ============================================================
 echo ""
-echo "==> 定位 Pod cgroup"
-QOS_CLASS=$(kubectl get pod "${POD_NAME}" -o jsonpath='{.status.qosClass}' 2>/dev/null || true)
-if [ -z "${POD_UID}" ] || [ -z "${QOS_CLASS}" ]; then
-    echo "错误: 无法获取 Pod UID/QoS，请检查 Pod 是否存在: ${POD_NAME}"
-    exit 1
-fi
+if [ "${PERF_ENABLED}" = "1" ]; then
+    echo "==> 定位 Pod cgroup"
+    QOS_CLASS=$(kubectl get pod "${POD_NAME}" -o jsonpath='{.status.qosClass}' 2>/dev/null || true)
+    if [ -z "${POD_UID}" ] || [ -z "${QOS_CLASS}" ]; then
+        echo "错误: 无法获取 Pod UID/QoS，请检查 Pod 是否存在: ${POD_NAME}"
+        exit 1
+    fi
 
-CGROUP_PATH=$(get_pod_cgroup_path "${POD_UID}" "${QOS_CLASS}")
-CGROUP_FULL="${CGROUP_ROOT}${CGROUP_PATH}"
-echo "    Pod UID: ${POD_UID}"
-echo "    QoS: ${QOS_CLASS}"
-echo "    cgroup 路径: ${CGROUP_PATH}"
+    CGROUP_PATH=$(get_pod_cgroup_path "${POD_UID}" "${QOS_CLASS}")
+    CGROUP_FULL="${CGROUP_ROOT}${CGROUP_PATH}"
+    echo "    Pod UID: ${POD_UID}"
+    echo "    QoS: ${QOS_CLASS}"
+    echo "    cgroup 路径: ${CGROUP_PATH}"
+else
+    echo "==> 跳过 Pod cgroup 定位: PERF_MODE=none"
+fi
 
 echo "==> 获取 Pod IP"
 POD_IP=$(kubectl get pod "${POD_NAME}" -o jsonpath='{.status.podIP}' 2>/dev/null)
@@ -324,11 +340,13 @@ if [ -z "${POD_IP}" ]; then
 fi
 echo "    Pod IP: ${POD_IP}"
 
-if [ ! -d "${CGROUP_FULL}" ]; then
-    echo "错误: cgroup 路径不存在: ${CGROUP_FULL}"
-    exit 1
+if [ "${PERF_ENABLED}" = "1" ]; then
+    if [ ! -d "${CGROUP_FULL}" ]; then
+        echo "错误: cgroup 路径不存在: ${CGROUP_FULL}"
+        exit 1
+    fi
+    echo "    cgroup 路径已验证: ${CGROUP_FULL}"
 fi
-echo "    cgroup 路径已验证: ${CGROUP_FULL}"
 
 echo "==> 启动 vLLM 日志捕获"
 kubectl logs -f "${POD_NAME}" -c "${CONTAINER_NAME}" > "${VLLM_LOG}" 2>&1 &
@@ -340,10 +358,15 @@ echo "    日志文件: ${VLLM_LOG}"
 # 阶段 2: 启动 perf 并按模式选择 stat / record
 # ============================================================
 echo ""
-echo "==> 启动 perf 测量"
-echo "    模式: ${PERF_MODE}"
-echo "    注意: perf 测量起点为 cgroup 解析完成后，K8s 调度阶段不在覆盖范围"
-echo ""
+if [ "${PERF_ENABLED}" = "1" ]; then
+    echo "==> 启动 perf 测量"
+    echo "    模式: ${PERF_MODE}"
+    echo "    注意: perf 测量起点为 cgroup 解析完成后，K8s 调度阶段不在覆盖范围"
+    echo ""
+else
+    echo "==> 跳过 perf 测量: PERF_MODE=none"
+    echo ""
+fi
 
 start_perf_stat() {
     echo "--- 启动 perf stat ---"
@@ -389,6 +412,8 @@ case "${PERF_MODE}" in
         start_perf_stat
         start_perf_record
         ;;
+    none)
+        ;;
 esac
 
 # ============================================================
@@ -421,8 +446,12 @@ SUB4_TIME=$(elapsed_since "${T_RUNNING}")
 TOTAL_TIME=$(elapsed_since "${T_APPLY}")
 
 echo ""
-echo "==> 停止 perf 测量"
-stop_perf
+if [ "${PERF_ENABLED}" = "1" ]; then
+    echo "==> 停止 perf 测量"
+    stop_perf
+else
+    echo "==> 跳过停止 perf 测量: PERF_MODE=none"
+fi
 
 # 停止日志捕获
 [ -n "${MAIN_LOG_PID}" ] && kill "${MAIN_LOG_PID}" 2>/dev/null || true
@@ -482,7 +511,15 @@ fi
 echo "--- 输出文件 ---"
 echo "  完整日志:   ${LOG_FILE}"
 echo "  启动日志:   ${VLLM_LOG}"
-echo "  perf stat:  ${STAT_OUTPUT}"
-echo "  perf record: ${RECORD_FILE}"
+if [ "${PERF_MODE}" = "stat" ] || [ "${PERF_MODE}" = "all" ]; then
+    echo "  perf stat:  ${STAT_OUTPUT}"
+fi
+if [ "${PERF_MODE}" = "record" ] || [ "${PERF_MODE}" = "all" ]; then
+    echo "  perf record: ${RECORD_FILE}"
+elif [ "${PERF_MODE}" = "stat" ]; then
+    echo "  perf record: 未启用（使用 PERF_MODE=record 或 PERF_MODE=all 生成 .data）"
+else
+    echo "  perf:        未启用（PERF_MODE=none）"
+fi
 echo ""
 echo "==> $(date) 测量完成"

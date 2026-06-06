@@ -11,7 +11,28 @@
 | `perf-startup-kata.sh` | `kata-qemu-nvidia-gpu` | `gpu-pod-kata.yaml` | `gpu-pod-kata` |
 | `perf-startup-runc.sh` | `nvidia` (runc) | `gpu-pod-runc.yaml` | `gpu-pod-runc` |
 
-这些脚本会自动启动 Pod、通过 cgroup v2 定位 Pod 进程、运行 perf 采样，并在退出时自动清理 Pod。
+这些脚本会自动启动 Pod、通过 cgroup v2 定位 Pod 进程、运行 perf 采样，并在退出时自动清理 Pod。`perf-startup-*.sh` 可使用 `PERF_MODE=none` 只测启动耗时，不启动 perf。
+
+## Kata QEMU VFIO trace wrapper
+
+`startVM-split/kata-qemu-vfio-traced/` 提供一个 `qemu-system-x86_64` wrapper，用于把 Kata `kata-qemu-nvidia-gpu` 启动 VM 时的真实 QEMU 调用记录下来，并追加 QEMU `-trace` 参数采集 VFIO/GPU 设备挂载相关事件。
+
+典型用途是定位 startVM 阶段 NVIDIA GPU VFIO attach、PCI BAR、MSI/MSI-X、KVM、memory region 等路径上的耗时瓶颈。
+
+部署方式是向 `/opt/kata/share/defaults/kata-containers/runtimes/qemu-nvidia-gpu/conf.d/` 写入专用 override TOML，指定 `[hypervisor.qemu].path` 为 wrapper。
+
+```bash
+cd startVM-split/kata-qemu-vfio-traced
+sudo ./deploy.sh
+
+# 启动 runtimeClassName: kata-qemu-nvidia-gpu 的 Pod 后查看:
+sudo ls -lh /var/log/kata-qemu-vfio-trace/
+
+# 调试完成后恢复:
+sudo ./restore.sh
+```
+
+如 Kata qemu-nvidia-gpu 的 drop-in 目录不在默认路径，使用 `sudo KATA_CONF_D=/path/to/conf.d ./deploy.sh`。详细参数见 `startVM-split/kata-qemu-vfio-traced/README.md`。
 
 ## 常规采样环境变量
 
@@ -34,10 +55,10 @@ PERF_DURATION=60 PERF_RECORD=1 ./perf-runc-start.sh
 ## 前置依赖
 
 - `kubectl`（可操作目标集群）
-- `perf`（通常由 `linux-tools` 包提供）
-- `sudo`（NOPASSWD，perf 需要 root 权限）
+- `perf`（通常由 `linux-tools` 包提供；仅启用 perf 采样时需要）
+- `sudo`（NOPASSWD，perf 需要 root 权限；仅启用 perf 采样时需要）
 - `curl`（仅 `perf-startup-*.sh` 用于检测 `/health`）
-- 系统使用 **cgroup v2**
+- 系统使用 **cgroup v2**（仅启用 perf 采样时需要）
 
 ## 常规采样输出
 
@@ -68,8 +89,19 @@ PERF_DURATION=60 PERF_RECORD=1 ./perf-runc-start.sh
 | `record`（默认） | `./perf-startup-runc.sh` 或 `./perf-startup-kata.sh` | 火焰图 / profile |
 | `stat` | `PERF_MODE=stat ./perf-startup-runc.sh` | 稳定 CPU 计数器 |
 | `all` | `PERF_MODE=all ./perf-startup-runc.sh` | 同时启用 stat + record |
+| `none` | `PERF_MODE=none ./perf-startup-runc.sh` | 只测启动耗时，不启动 perf |
 
 Kata 启动测量把上述命令中的 `perf-startup-runc.sh` 替换为 `perf-startup-kata.sh` 即可。
+
+### Kata 容器 Started 后提前退出
+
+`perf-startup-kata.sh` 可只测到容器出现 Kubernetes `Started` 事件，不继续启动 perf、捕获日志、获取 Pod IP 或等待 vLLM `/health`。
+
+```bash
+EXIT_AFTER_CONTAINER_STARTED=1 ./perf-startup-kata.sh
+```
+
+该模式正常退出，Pod 清理仍由 `KEEP_POD` 控制；默认 `KEEP_POD=0` 会删除 Pod。
 
 ### 时间分解
 
@@ -90,8 +122,9 @@ Kata 启动测量把上述命令中的 `perf-startup-runc.sh` 替换为 `perf-st
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `PERF_MODE` | `record` | 测量模式: `record` / `stat` / `all` |
+| `PERF_MODE` | `record` | 测量模式: `record` / `stat` / `all` / `none` |
 | `STARTUP_TIMEOUT` | `600` | 等 vLLM ready 的最大秒数 |
+| `EXIT_AFTER_CONTAINER_STARTED` | `0` | 仅 `perf-startup-kata.sh` 使用；1=容器 Started 后立即结束，不启动 perf |
 | `KEEP_POD` | `0` | 正常结束时保留 Pod（1=保留） |
 | `KEEP_POD_ON_ERROR` | `1` | 异常退出时保留 Pod 用于诊断 |
 | `CONTAINER_NAME` | `cuda-container` | 容器名称 |

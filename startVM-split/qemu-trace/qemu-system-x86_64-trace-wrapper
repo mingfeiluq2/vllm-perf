@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REAL_QEMU="/opt/kata/bin/qemu-system-x86_64"
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TRACE_EVENTS="${BASE_DIR}/qemu-trace-events"
+TRACE_DIR="${BASE_DIR}/qemu-trace-logs"
+TRACE_FILE="${TRACE_DIR}/qemu-trace-$(date +%Y%m%d-%H%M%S)-$$.log"
+
+mkdir -p "$TRACE_DIR"
+
+exec "$REAL_QEMU" \
+  -trace "events=${TRACE_EVENTS},file=${TRACE_FILE}" \
+  -msg timestamp=on \
+  "$@"

@@ -1,1 +1,10 @@
-/perf-logs
+# Logs and benchmark outputs
+/perf-logs/
+logs/
+*-logs/
+log/
+*-log/
+results/
+*-results/
+result/
+*-result/
