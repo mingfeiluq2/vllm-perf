@@ -1,0 +1,2 @@
+# First non-empty, non-comment line is used as the perf record -e value.
+cycles

@@ -1,0 +1,2 @@
+# First non-empty, non-comment line is used as the perf stat -e value.
+cycles,instructions,cache-references,cache-misses,branch-misses,context-switches,cpu-migrations,page-faults

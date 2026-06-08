@@ -44,12 +44,13 @@ spec:
           imagePullPolicy: Never
           resources:
               limits:
-                  #cpu: "14"
-                  #memory: "60Gi"
+                  cpu: "2"
+                  memory: "56Gi"
+                  hugepages-2Mi: "64Gi"
                   nvidia.com/pgpu: 1
               requests:
-                  #cpu: "14"
-                  #memory: "60Gi"
+                  cpu: "2"
+                  memory: "56Gi"
                   nvidia.com/pgpu: 1
           ports:
               - containerPort: 8000

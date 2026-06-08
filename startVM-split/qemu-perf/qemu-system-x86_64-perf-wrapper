@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REAL_QEMU="/usr/bin/qemu-system-x86_64"
+PERF="/usr/bin/perf"
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MODE_FILE="${BASE_DIR}/qemu-perf-mode"
+STAT_EVENTS_FILE="${BASE_DIR}/qemu-perf-stat-events"
+RECORD_EVENT_FILE="${BASE_DIR}/qemu-perf-record-event"
+LOG_DIR="${BASE_DIR}/qemu-perf-logs"
+RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
+STAT_OUTPUT="${LOG_DIR}/qemu-perf-stat-${RUN_ID}.txt"
+RECORD_FILE="${LOG_DIR}/qemu-perf-record-${RUN_ID}.data"
+
+read_first_value() {
+  local file="$1"
+
+  sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$file" | head -n 1
+}
+
+if [[ ! -x "$PERF" ]]; then
+  echo "ERROR: perf not found or not executable: $PERF" >&2
+  exit 1
+fi
+
+if [[ ! -x "$REAL_QEMU" ]]; then
+  echo "ERROR: real QEMU not found or not executable: $REAL_QEMU" >&2
+  exit 1
+fi
+
+for config_file in "$MODE_FILE" "$STAT_EVENTS_FILE" "$RECORD_EVENT_FILE"; do
+  if [[ ! -f "$config_file" ]]; then
+    echo "ERROR: config file not found: $config_file" >&2
+    exit 1
+  fi
+done
+
+PERF_MODE="$(read_first_value "$MODE_FILE")"
+STAT_EVENTS="$(read_first_value "$STAT_EVENTS_FILE")"
+RECORD_EVENT="$(read_first_value "$RECORD_EVENT_FILE")"
+
+case "$PERF_MODE" in
+  stat|record) ;;
+  *)
+    echo "ERROR: invalid qemu perf mode '$PERF_MODE', expected: stat / record" >&2
+    exit 1
+    ;;
+esac
+
+if [[ -z "$STAT_EVENTS" ]]; then
+  echo "ERROR: no valid perf stat events found in: $STAT_EVENTS_FILE" >&2
+  exit 1
+fi
+
+if [[ -z "$RECORD_EVENT" ]]; then
+  echo "ERROR: no valid perf record event found in: $RECORD_EVENT_FILE" >&2
+  exit 1
+fi
+
+mkdir -p "$LOG_DIR"
+
+case "$PERF_MODE" in
+  stat)
+    exec "$PERF" stat \
+      -e "$STAT_EVENTS" \
+      -o "$STAT_OUTPUT" \
+      -- "$REAL_QEMU" "$@"
+    ;;
+  record)
+    exec "$PERF" record \
+      -g \
+      -e "$RECORD_EVENT" \
+      -o "$RECORD_FILE" \
+      -- "$REAL_QEMU" "$@"
+    ;;
+esac

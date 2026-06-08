@@ -1,1 +1,1 @@
-ioctl
+openat,close,ftruncate,fallocate,mmap,mmap2,munmap,mremap,mprotect,mbind,set_mempolicy,get_mempolicy,mlock,mlock2,prlimit64,ioctl
