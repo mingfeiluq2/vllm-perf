@@ -22,6 +22,12 @@ read_first_config_value() {
     fi
 }
 
+sanitize_filename_token() {
+    local value="$1"
+
+    printf '%s' "${value}" | tr -c 'A-Za-z0-9_.-' '_'
+}
+
 trim_whitespace() {
     sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
 }
@@ -238,6 +244,94 @@ get_pod_cgroup_path() {
     return 1
 }
 
+read_cpu_stat_field() {
+    local file="$1"
+    local field="$2"
+
+    awk -v field="${field}" '
+        $1 == field {
+            print $2
+            found = 1
+            exit
+        }
+        END {
+            if (!found) {
+                exit 1
+            }
+        }
+    ' "${file}"
+}
+
+usec_to_seconds() {
+    local usec="$1"
+
+    awk -v usec="${usec}" 'BEGIN { printf "%.6f", usec / 1000000 }'
+}
+
+capture_cgroup_cpu_snapshot() {
+    local prefix="$1"
+    local cpu_stat_file="${CGROUP_FULL}/cpu.stat"
+    local usage_usec
+    local user_usec
+    local system_usec
+
+    if [ ! -f "${cpu_stat_file}" ]; then
+        echo "错误: cgroup cpu.stat 不存在: ${cpu_stat_file}" >&2
+        return 1
+    fi
+
+    usage_usec=$(read_cpu_stat_field "${cpu_stat_file}" "usage_usec") || {
+        echo "错误: ${cpu_stat_file} 缺少 usage_usec" >&2
+        return 1
+    }
+    user_usec=$(read_cpu_stat_field "${cpu_stat_file}" "user_usec") || {
+        echo "错误: ${cpu_stat_file} 缺少 user_usec" >&2
+        return 1
+    }
+    system_usec=$(read_cpu_stat_field "${cpu_stat_file}" "system_usec") || {
+        echo "错误: ${cpu_stat_file} 缺少 system_usec" >&2
+        return 1
+    }
+
+    printf -v "CGROUP_CPU_${prefix}_USAGE_USEC" "%s" "${usage_usec}"
+    printf -v "CGROUP_CPU_${prefix}_USER_USEC" "%s" "${user_usec}"
+    printf -v "CGROUP_CPU_${prefix}_SYSTEM_USEC" "%s" "${system_usec}"
+}
+
+calculate_cgroup_cpu_delta() {
+    CGROUP_CPU_USAGE_DELTA_USEC=$((CGROUP_CPU_END_USAGE_USEC - CGROUP_CPU_START_USAGE_USEC))
+    CGROUP_CPU_USER_DELTA_USEC=$((CGROUP_CPU_END_USER_USEC - CGROUP_CPU_START_USER_USEC))
+    CGROUP_CPU_SYSTEM_DELTA_USEC=$((CGROUP_CPU_END_SYSTEM_USEC - CGROUP_CPU_START_SYSTEM_USEC))
+    CGROUP_CPU_DELTA_READY=1
+}
+
+print_cgroup_cpu_delta_line() {
+    local label="$1"
+    local start_usec="$2"
+    local end_usec="$3"
+    local delta_usec="$4"
+
+    printf "  cgroup %-6s delta: %12s usec (%s s), start=%s, end=%s\n" \
+        "${label}" "${delta_usec}" "$(usec_to_seconds "${delta_usec}")" "${start_usec}" "${end_usec}"
+}
+
+print_cgroup_cpu_usage_results() {
+    echo "--- cgroup CPU 使用时间 (cpu.stat) ---"
+    echo "  cgroup 路径: ${CGROUP_FULL}"
+
+    if [ "${CGROUP_CPU_DELTA_READY}" != "1" ]; then
+        echo "  (cgroup CPU 使用时间未生成)"
+        echo ""
+        return 0
+    fi
+
+    print_cgroup_cpu_delta_line "usage" "${CGROUP_CPU_START_USAGE_USEC}" "${CGROUP_CPU_END_USAGE_USEC}" "${CGROUP_CPU_USAGE_DELTA_USEC}"
+    print_cgroup_cpu_delta_line "user" "${CGROUP_CPU_START_USER_USEC}" "${CGROUP_CPU_END_USER_USEC}" "${CGROUP_CPU_USER_DELTA_USEC}"
+    print_cgroup_cpu_delta_line "system" "${CGROUP_CPU_START_SYSTEM_USEC}" "${CGROUP_CPU_END_SYSTEM_USEC}" "${CGROUP_CPU_SYSTEM_DELTA_USEC}"
+    echo "  注: cgroup CPU time 是多 CPU 累计时间，可能大于 benchmark wall time。"
+    echo ""
+}
+
 start_perf_stat() {
     echo "--- 启动 perf stat ---"
     echo "    事件: ${PERF_STAT_EVENTS}"
@@ -369,13 +463,18 @@ run_benchmark() {
     printf "\n"
     echo ""
 
+    capture_cgroup_cpu_snapshot "START"
     BENCH_START=$(now_sec)
+    record_timepoint "cgroup_cpu_start" "读取 benchmark 前 cgroup cpu.stat"
     record_timepoint "bench_start" "开始执行 vllm bench serve"
     set +e
     "${bench_run_cmd[@]}" > >(tee -a "${BENCH_LOG}") 2>&1
     bench_status=$?
     set -e
     BENCH_END=$(now_sec)
+    capture_cgroup_cpu_snapshot "END"
+    calculate_cgroup_cpu_delta
+    record_timepoint "cgroup_cpu_end" "读取 benchmark 后 cgroup cpu.stat"
     record_timepoint "bench_end" "vllm bench serve 结束，退出码 ${bench_status}"
     BENCH_TIME=$(duration_between "${BENCH_START}" "${BENCH_END}")
 
@@ -431,6 +530,18 @@ MAIN_LOG_PID=""
 PERF_STAT_PID=""
 PERF_RECORD_PID=""
 BENCH_TIME="N/A"
+CGROUP_PATH=""
+CGROUP_FULL=""
+CGROUP_CPU_DELTA_READY=0
+CGROUP_CPU_START_USAGE_USEC=""
+CGROUP_CPU_START_USER_USEC=""
+CGROUP_CPU_START_SYSTEM_USEC=""
+CGROUP_CPU_END_USAGE_USEC=""
+CGROUP_CPU_END_USER_USEC=""
+CGROUP_CPU_END_SYSTEM_USEC=""
+CGROUP_CPU_USAGE_DELTA_USEC=""
+CGROUP_CPU_USER_DELTA_USEC=""
+CGROUP_CPU_SYSTEM_DELTA_USEC=""
 SCRIPT_START_TIME=$(now_sec)
 
 mkdir -p "${LOG_DIR}"
@@ -496,14 +607,14 @@ for cmd in ${REQUIRED_CMDS}; do
     fi
 done
 
+if [ ! -f "${CGROUP_ROOT}/cgroup.controllers" ]; then
+    echo "错误: ${CGROUP_ROOT} 不是 cgroup v2 根目录"
+    exit 1
+fi
+
 if [ "${PERF_ENABLED}" = "1" ]; then
     if ! sudo -n true 2>/dev/null; then
         echo "错误: sudo 需要无密码访问（用于 perf）"
-        exit 1
-    fi
-
-    if [ ! -f "${CGROUP_ROOT}/cgroup.controllers" ]; then
-        echo "错误: ${CGROUP_ROOT} 不是 cgroup v2 根目录"
         exit 1
     fi
 
@@ -632,30 +743,31 @@ while true; do
     sleep 2
 done
 
-if [ "${PERF_ENABLED}" = "1" ]; then
-    echo "==> 定位 Pod cgroup"
-    record_timepoint "cgroup_lookup_start" "开始定位 Pod cgroup"
-    QOS_CLASS=$(kubectl get pod "${POD_NAME}" -o jsonpath='{.status.qosClass}' 2>/dev/null || true)
-    if [ -z "${POD_UID}" ] || [ -z "${QOS_CLASS}" ]; then
-        echo "错误: 无法获取 Pod UID/QoS，请检查 Pod 是否存在: ${POD_NAME}"
-        exit 1
-    fi
-
-    CGROUP_PATH=$(get_pod_cgroup_path "${POD_UID}" "${QOS_CLASS}")
-    CGROUP_FULL="${CGROUP_ROOT}${CGROUP_PATH}"
-    echo "    Pod UID: ${POD_UID}"
-    echo "    QoS: ${QOS_CLASS}"
-    echo "    cgroup 路径: ${CGROUP_PATH}"
-
-    if [ ! -d "${CGROUP_FULL}" ]; then
-        echo "错误: cgroup 路径不存在: ${CGROUP_FULL}"
-        exit 1
-    fi
-    echo "    cgroup 路径已验证: ${CGROUP_FULL}"
-    record_timepoint "cgroup_lookup_done" "Pod cgroup 已定位: ${CGROUP_PATH}"
-else
-    echo "==> 跳过 Pod cgroup 定位: PERF_MODE=none"
+echo "==> 定位 Pod cgroup"
+record_timepoint "cgroup_lookup_start" "开始定位 Pod cgroup"
+QOS_CLASS=$(kubectl get pod "${POD_NAME}" -o jsonpath='{.status.qosClass}' 2>/dev/null || true)
+if [ -z "${POD_UID}" ] || [ -z "${QOS_CLASS}" ]; then
+    echo "错误: 无法获取 Pod UID/QoS，请检查 Pod 是否存在: ${POD_NAME}"
+    exit 1
 fi
+
+CGROUP_PATH=$(get_pod_cgroup_path "${POD_UID}" "${QOS_CLASS}")
+CGROUP_FULL="${CGROUP_ROOT}${CGROUP_PATH}"
+echo "    Pod UID: ${POD_UID}"
+echo "    QoS: ${QOS_CLASS}"
+echo "    cgroup 路径: ${CGROUP_PATH}"
+
+if [ ! -d "${CGROUP_FULL}" ]; then
+    echo "错误: cgroup 路径不存在: ${CGROUP_FULL}"
+    exit 1
+fi
+if [ ! -f "${CGROUP_FULL}/cpu.stat" ]; then
+    echo "错误: cgroup cpu.stat 不存在: ${CGROUP_FULL}/cpu.stat"
+    exit 1
+fi
+echo "    cgroup 路径已验证: ${CGROUP_FULL}"
+echo "    cpu.stat: ${CGROUP_FULL}/cpu.stat"
+record_timepoint "cgroup_lookup_done" "Pod cgroup 已定位: ${CGROUP_PATH}"
 
 echo ""
 if [ "${PERF_ENABLED}" = "1" ]; then
@@ -693,6 +805,8 @@ echo "  Pod Ready 耗时:       $(duration_between "${T_RUNNING}" "${T_READY}")s
 echo "  Benchmark 耗时:       ${BENCH_TIME}s"
 echo "  Benchmark 退出码:     ${BENCH_STATUS}"
 echo ""
+
+print_cgroup_cpu_usage_results
 
 record_timepoint "script_end" "脚本主流程结束"
 print_timepoints_summary

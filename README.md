@@ -104,7 +104,7 @@ PERF_DURATION=60 PERF_RECORD=1 ./perf-runc-start.sh
 - `perf`（通常由 `linux-tools` 包提供；仅启用 perf 采样时需要）
 - `sudo`（NOPASSWD，perf 需要 root 权限；仅启用 perf 采样时需要）
 - `curl`（`vllm-start-perf/perf-startup-*.sh` 和 `vllm-bench-perf/perf-bench-*.sh` 用于检测 `/health`）
-- 系统使用 **cgroup v2**（仅启用 perf 采样时需要）
+- 系统使用 **cgroup v2**（perf 采样和 benchmark cgroup CPU 使用时间保存需要）
 
 ## 常规采样输出
 
@@ -134,7 +134,7 @@ sudo ./chmod-perf-files-rw.sh perf-logs startVM-split/qemu-perf/qemu-perf-logs
 
 ## vLLM benchmark 压测采样
 
-`vllm-bench-perf/perf-bench-kata.sh` 和 `vllm-bench-perf/perf-bench-runc.sh` 会先启动对应的 vLLM serve Pod，等待 `/health` 返回成功，再定位 Pod cgroup。随后脚本启动 perf，通过宿主机执行 `vllm bench serve` 压测 Pod IP，并在 benchmark 命令结束后立即停止 perf。
+`vllm-bench-perf/perf-bench-kata.sh` 和 `vllm-bench-perf/perf-bench-runc.sh` 会先启动对应的 vLLM serve Pod，等待 `/health` 返回成功，再定位 Pod cgroup。随后脚本读取 benchmark 前的 cgroup v2 `cpu.stat`，启动 perf，通过宿主机执行 `vllm bench serve` 压测 Pod IP，并在 benchmark 命令结束后立即读取 `cpu.stat`、停止 perf、打印 cgroup CPU 使用时间差值。
 
 ```bash
 # runc: 默认 record 模式，benchmark 参数来自配置文件
@@ -156,6 +156,8 @@ Perf 配置文件读取方式和启动测量一致：每个配置文件使用第
 | `vllm-bench-perf/perf-bench-runc-mode` | `record` | runc benchmark perf 模式，可选 `stat` / `record` / `all` / `none` |
 | `vllm-bench-perf/perf-bench-runc-stat-events` | cycles/instructions/cache/fault 事件 | runc 传给 `perf stat -e` 的事件列表 |
 | `vllm-bench-perf/perf-bench-runc-record-event` | `cycles` | runc 传给 `perf record -e` 的事件 |
+
+`PERF_MODE=none` 只跳过 perf，benchmark 脚本仍会定位 Pod cgroup 并读取 `cpu.stat`，因此仍要求宿主机使用 cgroup v2。
 
 ### Benchmark 参数配置
 
@@ -184,6 +186,9 @@ Perf 配置文件读取方式和启动测量一致：每个配置文件使用第
 - benchmark stdout/stderr: `vllm-bench-perf/perf-logs/vllm_bench_<runtime>_<timestamp>.log`
 - benchmark JSON: `vllm-bench-perf/perf-logs/vllm_bench_<runtime>_<timestamp>.json`
 - perf 输出: `perf_bench_<runtime>_stat_<timestamp>.txt` / `perf_bench_<runtime>_record_<timestamp>.data`
+- cgroup CPU 使用时间差值: 打印在完整脚本日志中，不额外生成文件；包含 `usage_usec`、`user_usec`、`system_usec` 的 start/end/delta
+
+cgroup CPU time 是 cgroup 内所有 CPU 上的累计使用时间，因此 delta seconds 可能大于 benchmark 的 wall time。
 
 阶段时间点 TSV 列固定为:
 
