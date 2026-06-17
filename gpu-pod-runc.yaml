@@ -26,9 +26,9 @@ spec:
     containers:
         - name: cuda-container
           image: docker.io/vllm/vllm-openai:v0.20.1-cu129-ubuntu2404
-          env:
-          - name: CUDA_VISIBLE_DEVICES
-            value: "0"
+          # env:
+          # - name: CUDA_VISIBLE_DEVICES
+          #   value: "0"
           command:
               - bash
               - -lc
@@ -41,7 +41,7 @@ spec:
                   nvidia-smi -L
                   echo "=== start vLLM ==="
                   exec vllm serve /model \
-                    --tensor-parallel-size 1 \
+                    --tensor-parallel-size 2 \
                     --host 0.0.0.0 \
                     --port 8000 \
                     --max-num-batched-tokens 8192 \
@@ -51,12 +51,12 @@ spec:
               requests:
                   cpu: "16"
                   memory: "64Gi"
-                #   nvidia.com/gpu: "1"
+                  nvidia.com/gpu: "2"
               limits:
                   cpu: "16"
                   memory: "64Gi"
-                  hugepages-2Mi: "64Gi"
-                #   nvidia.com/gpu: "1"
+                  # hugepages-2Mi: "64Gi"
+                  nvidia.com/gpu: "2"
 
           ports:
               - containerPort: 8000

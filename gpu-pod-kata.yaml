@@ -36,7 +36,7 @@ spec:
                   nvidia-smi -L
                   echo "=== start vLLM ==="
                   exec vllm serve /model \
-                    --tensor-parallel-size 1 \
+                    --tensor-parallel-size 2 \
                     --host 0.0.0.0 \
                     --port 8000 \
                     --max-num-batched-tokens 8192 \
@@ -44,14 +44,14 @@ spec:
           imagePullPolicy: Never
           resources:
               limits:
-                  cpu: "2"
+                  cpu: "16"
                   memory: "56Gi"
-                  hugepages-2Mi: "64Gi"
-                  nvidia.com/pgpu: 1
+                #   hugepages-2Mi: "64Gi"
+                  nvidia.com/pgpu: 2
               requests:
-                  cpu: "2"
+                  cpu: "16"
                   memory: "56Gi"
-                  nvidia.com/pgpu: 1
+                  nvidia.com/pgpu: 2
           ports:
               - containerPort: 8000
           volumeMounts: # <-- 新增：容器内挂载配置

@@ -12,8 +12,9 @@
 | `vllm-start-perf/perf-startup-runc.sh` | `nvidia` (runc) | `gpu-pod-runc.yaml` | `gpu-pod-runc` |
 | `vllm-bench-perf/perf-bench-kata.sh` | `kata-qemu-nvidia-gpu` | `gpu-pod-kata.yaml` | `gpu-pod-kata` |
 | `vllm-bench-perf/perf-bench-runc.sh` | `nvidia` (runc) | `gpu-pod-runc.yaml` | `gpu-pod-runc` |
+| `core-test/verify-cpu-pin-sched-overhead.sh` | 已运行 Pod | 不启动 Pod | 由 Pod IP 自动定位 |
 
-这些脚本会自动启动 Pod、通过 cgroup v2 定位 Pod 进程、运行 perf 采样，并在退出时自动清理 Pod。`vllm-start-perf/perf-startup-*.sh` 可使用 `PERF_MODE=none` 只测启动耗时，不启动 perf；`vllm-bench-perf/perf-bench-*.sh` 会在 vLLM 服务 ready 后从宿主机运行 `vllm bench serve`，perf 只覆盖 benchmark 执行窗口。
+除 `core-test/verify-cpu-pin-sched-overhead.sh` 只观测已运行 Pod 外，其余 perf 脚本会自动启动 Pod、通过 cgroup v2 定位 Pod 进程、运行 perf 采样，并在退出时自动清理 Pod。`vllm-start-perf/perf-startup-*.sh` 可使用 `PERF_MODE=none` 只测启动耗时，不启动 perf；`vllm-bench-perf/perf-bench-*.sh` 会在 vLLM 服务 ready 后从宿主机运行 `vllm bench serve`，perf 只覆盖 benchmark 执行窗口。
 
 ## GPU 绑定到 vfio-pci
 
@@ -195,6 +196,44 @@ cgroup CPU time 是 cgroup 内所有 CPU 上的累计使用时间，因此 delta
 ```text
 key	epoch	elapsed_since_start_sec	local_time	description
 ```
+
+## CPU pin 调度开销验证
+
+`core-test/verify-cpu-pin-sched-overhead.sh` 用于验证 CPU pin 后 vLLM 吞吐量上升是否伴随调度开销下降。脚本只观测两个已经运行的 vLLM Pod，不负责切换 CPU pin 状态；传入的目标必须是 Pod IP，而不是 Service IP。脚本会通过 `kubectl get pod -A -o json` 反查 Pod UID/QoS，定位 cgroup v2 路径，在每轮 `vllm bench serve` 窗口内运行 `sudo perf stat -a --cgroup <pod-cgroup>`。
+
+```bash
+cd core-test
+
+BASELINE_TARGETS="nopin=10.244.0.125" \
+PINNED_TARGETS="pin=10.244.0.126" \
+./verify-cpu-pin-sched-overhead.sh
+```
+
+常用环境变量：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `BASELINE_TARGETS` | 必填 | CPU pin 前目标，格式 `label=podIP`，可多个空格分隔 |
+| `PINNED_TARGETS` | 必填 | CPU pin 后目标，格式 `label=podIP`，可多个空格分隔 |
+| `CONCURRENCY_LEVELS` | `1 2 4 8 16 32 64` | 依次测试的 `--max-concurrency` |
+| `REPEATS` | `3` | 每个并发度、每个目标重复次数 |
+| `COOLDOWN` | `5` | 每轮 benchmark 后冷却秒数 |
+| `CGROUP_ROOT` | `/sys/fs/cgroup` | cgroup v2 根目录 |
+| `PERF_EVENTS` | task-clock/context-switches/cpu-migrations 等 | 传给 `perf stat -e` 的事件列表；不可用 tracepoint 会自动跳过 |
+| `MIN_THROUGHPUT_GAIN_PCT` | `5` | 判定吞吐提升的最小百分比 |
+| `MIN_SCHED_DROP_PCT` | `10` | 判定单位 token 调度开销下降的最小百分比 |
+
+`BENCH_BACKEND`、`BENCH_PORT`、`BENCH_ENDPOINT`、`BENCH_MODEL`、`BENCH_DATASET_NAME`、`BENCH_INPUT_LEN`、`BENCH_OUTPUT_LEN`、`BENCH_NUM_PROMPTS`、`BENCH_REQUEST_RATE`、`BENCH_TOKENIZER`、`BENCH_NO_PROXY` 与 `core-test/vllm-bench-multi.sh` 默认值一致，其中 `BENCH_NO_PROXY` 默认为 `*`，避免 Pod IP 请求走本机代理。
+
+输出目录为 `core-test/perf-logs/cpu-pin-sched-verify/<timestamp>/`，包含：
+
+- `verify_cpu_pin_sched_overhead_<timestamp>.log`: 完整运行日志
+- `runs.jsonl`: 每轮 benchmark 的原始指标
+- `summary.csv`: 按 target/concurrency 聚合后的 CSV
+- `summary.md`: baseline 与 pinned 的并发度对比和最终结论
+- 每轮子目录中的 `vllm_bench.json`、`perf_stat.csv`、`cpu.stat.before.txt`、`cpu.stat.after.txt`、`cpuset.cpus.effective.txt`、`cgroup.procs.txt`
+
+判定逻辑使用 `output_token_throughput` 作为主吞吐指标；调度开销使用 `context-switches / 1k output tokens`、`cpu-migrations / 1k output tokens`、`system_cpu_usec / 1k output tokens`。当吞吐提升达到阈值，并且三个主调度指标中至少两个可用指标达到下降阈值时，`summary.md` 会输出“支持调度开销下降假设”。
 
 ## 启动性能测量
 
