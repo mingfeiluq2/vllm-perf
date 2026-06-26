@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REAL_QEMU="${QEMU_GPUDIRECT_REAL_QEMU:-/opt/kata/bin/qemu-system-x86_64}"
+PCI_SYSFS_ROOT="${QEMU_GPUDIRECT_PCI_SYSFS_ROOT:-/sys/bus/pci/devices}"
+CLIQUE_ID=0
+
+if [[ ! -x "${REAL_QEMU}" ]]; then
+    echo "ERROR: real QEMU not found or not executable: ${REAL_QEMU}" >&2
+    exit 1
+fi
+
+get_field_value() {
+    local spec="$1"
+    local wanted="${2,,}"
+    local field
+    local field_lower
+    local -a fields=()
+
+    IFS=',' read -r -a fields <<< "${spec}"
+    for field in "${fields[@]}"; do
+        field_lower="${field,,}"
+        if [[ "${field_lower}" == "${wanted}="* ]]; then
+            printf '%s\n' "${field#*=}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+normalize_bdf() {
+    local bdf="${1,,}"
+
+    if [[ "${bdf}" =~ ^[[:xdigit:]]{2}:[[:xdigit:]]{2}\.[[:xdigit:]]$ ]]; then
+        printf '0000:%s\n' "${bdf}"
+    else
+        printf '%s\n' "${bdf}"
+    fi
+}
+
+inject_clique() {
+    local spec="$1"
+    local model="${spec%%,*}"
+    local host_bdf
+    local device_dir
+    local vendor
+    local class
+    local existing_clique
+
+    if [[ "${model,,}" != "vfio-pci" ]]; then
+        printf '%s\n' "${spec}"
+        return 1
+    fi
+
+    if ! host_bdf="$(get_field_value "${spec}" host)"; then
+        echo "WARNING: cannot classify vfio-pci device without host=; leaving unchanged: ${spec}" >&2
+        printf '%s\n' "${spec}"
+        return 1
+    fi
+
+    host_bdf="$(normalize_bdf "${host_bdf}")"
+    device_dir="${PCI_SYSFS_ROOT%/}/${host_bdf}"
+    if [[ ! -r "${device_dir}/vendor" || ! -r "${device_dir}/class" ]]; then
+        echo "WARNING: cannot read PCI vendor/class for host=${host_bdf}; leaving vfio-pci device unchanged" >&2
+        printf '%s\n' "${spec}"
+        return 1
+    fi
+
+    vendor="$(<"${device_dir}/vendor")"
+    class="$(<"${device_dir}/class")"
+    if [[ "${vendor,,}" != "0x10de" || "${class,,}" != 0x03* ]]; then
+        printf '%s\n' "${spec}"
+        return 1
+    fi
+
+    if existing_clique="$(get_field_value "${spec}" x-nv-gpudirect-clique)"; then
+        echo "qemu-gpudirect-clique-wrapper: preserving existing x-nv-gpudirect-clique=${existing_clique} for host=${host_bdf}" >&2
+        printf '%s\n' "${spec}"
+        return 1
+    fi
+
+    printf '%s,x-nv-gpudirect-clique=%s\n' "${spec}" "${CLIQUE_ID}"
+    return 0
+}
+
+args=("$@")
+injected=0
+
+for ((i = 0; i < ${#args[@]}; i++)); do
+    case "${args[i]}" in
+        -device)
+            if ((i + 1 < ${#args[@]})); then
+                if updated="$(inject_clique "${args[i + 1]}")"; then
+                    args[i + 1]="${updated}"
+                    ((injected += 1))
+                fi
+                ((i += 1))
+            fi
+            ;;
+        -device=*)
+            spec="${args[i]#-device=}"
+            if updated="$(inject_clique "${spec}")"; then
+                args[i]="-device=${updated}"
+                ((injected += 1))
+            fi
+            ;;
+    esac
+done
+
+if ((injected > 0)); then
+    echo "qemu-gpudirect-clique-wrapper: added x-nv-gpudirect-clique=${CLIQUE_ID} to ${injected} NVIDIA GPU device(s)" >&2
+fi
+
+exec "${REAL_QEMU}" "${args[@]}"

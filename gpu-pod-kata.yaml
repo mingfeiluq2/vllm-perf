@@ -46,8 +46,12 @@ spec:
               limits:
                   cpu: "16"
                   memory: "56Gi"
+<<<<<<< Updated upstream
                 #   hugepages-2Mi: "64Gi"
                   nvidia.com/pgpu: 2
+=======
+                  nvidia.com/pgpu: 1
+>>>>>>> Stashed changes
               requests:
                   cpu: "16"
                   memory: "56Gi"
@@ -64,7 +68,7 @@ spec:
     volumes: # <-- 新增：卷定义
         - name: model-volume
           hostPath:
-              path: /home/liulei/models/Qwen/Qwen3___5-9B # 对应脚本中的 MODEL_DIR
+              path: /home/liulei/models/Qwen/Qwen3.5-0.8B # 对应脚本中的 MODEL_DIR
               type: Directory # 必须为已存在的目录（脚本已检查）
         - name: trace-volume
           hostPath:
