@@ -46,12 +46,8 @@ spec:
               limits:
                   cpu: "16"
                   memory: "56Gi"
-<<<<<<< Updated upstream
                 #   hugepages-2Mi: "64Gi"
                   nvidia.com/pgpu: 2
-=======
-                  nvidia.com/pgpu: 1
->>>>>>> Stashed changes
               requests:
                   cpu: "16"
                   memory: "56Gi"

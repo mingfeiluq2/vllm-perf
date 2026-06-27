@@ -26,12 +26,9 @@ spec:
     containers:
         - name: cuda-container
           image: docker.io/vllm/vllm-openai:v0.20.1-cu129-ubuntu2404
-<<<<<<< Updated upstream
           # env:
           # - name: CUDA_VISIBLE_DEVICES
           #   value: "0"
-=======
->>>>>>> Stashed changes
           command:
               - bash
               - -lc
@@ -54,21 +51,12 @@ spec:
               requests:
                   cpu: "16"
                   memory: "64Gi"
-<<<<<<< Updated upstream
-                  nvidia.com/gpu: "2"
+                  nvidia.com/gpu: 2
               limits:
                   cpu: "16"
                   memory: "64Gi"
                   # hugepages-2Mi: "64Gi"
-                  nvidia.com/gpu: "2"
-=======
-                  nvidia.com/gpu: "1"
-              limits:
-                  cpu: "16"
-                  memory: "64Gi"
-                #hugepages-2Mi: "64Gi"
-                  nvidia.com/gpu: "1"
->>>>>>> Stashed changes
+                  nvidia.com/gpu: 2
 
           ports:
               - containerPort: 8000

@@ -12,9 +12,11 @@
 | `vllm-start-perf/perf-startup-runc.sh` | `nvidia` (runc) | `gpu-pod-runc.yaml` | `gpu-pod-runc` |
 | `vllm-bench-perf/perf-bench-kata.sh` | `kata-qemu-nvidia-gpu` | `gpu-pod-kata.yaml` | `gpu-pod-kata` |
 | `vllm-bench-perf/perf-bench-runc.sh` | `nvidia` (runc) | `gpu-pod-runc.yaml` | `gpu-pod-runc` |
-| `core-test/verify-cpu-pin-sched-overhead.sh` | 已运行 Pod | 不启动 Pod | 由 Pod IP 自动定位 |
+| `core-test/vllm-bench-multi.sh` | 已运行 Pod | 不启动 Pod | 通过 `POD_NAME` 指定 |
+| `core-test/gpu-comm-test-kata.yaml` | `kata-qemu-nvidia-gpu` | 一次性 GPU 通信测试 Pod | `gpu-comm-test-kata` |
+| `core-test/gpu-comm-test-runc.yaml` | `nvidia` (runc) | 一次性 GPU 通信测试 Pod | `gpu-comm-test-runc` |
 
-除 `core-test/verify-cpu-pin-sched-overhead.sh` 只观测已运行 Pod 外，其余 perf 脚本会自动启动 Pod、通过 cgroup v2 定位 Pod 进程、运行 perf 采样，并在退出时自动清理 Pod。`vllm-start-perf/perf-startup-*.sh` 可使用 `PERF_MODE=none` 只测启动耗时，不启动 perf；`vllm-bench-perf/perf-bench-*.sh` 会在 vLLM 服务 ready 后从宿主机运行 `vllm bench serve`，perf 只覆盖 benchmark 执行窗口。
+除 `core-test/vllm-bench-multi.sh` 只 benchmark 已运行 Pod 外，其余 perf 脚本会自动启动 Pod、通过 cgroup v2 定位 Pod 进程、运行 perf 采样，并在退出时自动清理 Pod。`vllm-start-perf/perf-startup-*.sh` 可使用 `PERF_MODE=none` 只测启动耗时，不启动 perf；`vllm-bench-perf/perf-bench-*.sh` 会在 vLLM 服务 ready 后从宿主机运行 `vllm bench serve`，perf 只覆盖 benchmark 执行窗口。
 
 ## GPU 绑定到 vfio-pci
 
@@ -101,10 +103,10 @@ PERF_DURATION=60 PERF_RECORD=1 ./perf-runc-start.sh
 ## 前置依赖
 
 - `kubectl`（可操作目标集群）
-- `vllm`（仅 `vllm-bench-perf/perf-bench-*.sh` 需要，用于宿主机运行 `vllm bench serve`）
+- `vllm`（`vllm-bench-perf/perf-bench-*.sh` 和 `core-test/vllm-bench-multi.sh` 需要，用于宿主机运行 `vllm bench serve`）
 - `perf`（通常由 `linux-tools` 包提供；仅启用 perf 采样时需要）
 - `sudo`（NOPASSWD，perf 需要 root 权限；仅启用 perf 采样时需要）
-- `curl`（`vllm-start-perf/perf-startup-*.sh` 和 `vllm-bench-perf/perf-bench-*.sh` 用于检测 `/health`）
+- `curl`（`vllm-start-perf/perf-startup-*.sh`、`vllm-bench-perf/perf-bench-*.sh` 和 `core-test/vllm-bench-multi.sh` 用于检测 `/health`）
 - 系统使用 **cgroup v2**（perf 采样和 benchmark cgroup CPU 使用时间保存需要）
 
 ## 常规采样输出
@@ -197,43 +199,76 @@ cgroup CPU time 是 cgroup 内所有 CPU 上的累计使用时间，因此 delta
 key	epoch	elapsed_since_start_sec	local_time	description
 ```
 
-## CPU pin 调度开销验证
+## 单 Pod 多并发 benchmark
 
-`core-test/verify-cpu-pin-sched-overhead.sh` 用于验证 CPU pin 后 vLLM 吞吐量上升是否伴随调度开销下降。脚本只观测两个已经运行的 vLLM Pod，不负责切换 CPU pin 状态；传入的目标必须是 Pod IP，而不是 Service IP。脚本会通过 `kubectl get pod -A -o json` 反查 Pod UID/QoS，定位 cgroup v2 路径，在每轮 `vllm bench serve` 窗口内运行 `sudo perf stat -a --cgroup <pod-cgroup>`。
+`core-test/vllm-bench-multi.sh` 用于对一个已经运行的 vLLM Pod 执行多并发度 `vllm bench serve`。脚本不创建、不删除 Pod；它会通过 `POD_NAME` 定位 Pod，自动读取 Pod IP，等待 Pod `Running` 且 `/health` 成功，然后在 benchmark 前保存 live Pod YAML 和容器日志。
 
 ```bash
-cd core-test
-
-BASELINE_TARGETS="nopin=10.244.0.125" \
-PINNED_TARGETS="pin=10.244.0.126" \
-./verify-cpu-pin-sched-overhead.sh
+POD_NAME=gpu-pod-runc \
+POD_NAMESPACE=default \
+CONCURRENCY_LEVELS="1 2 4 8 16 32 64" \
+./core-test/vllm-bench-multi.sh
 ```
 
 常用环境变量：
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `BASELINE_TARGETS` | 必填 | CPU pin 前目标，格式 `label=podIP`，可多个空格分隔 |
-| `PINNED_TARGETS` | 必填 | CPU pin 后目标，格式 `label=podIP`，可多个空格分隔 |
-| `CONCURRENCY_LEVELS` | `1 2 4 8 16 32 64` | 依次测试的 `--max-concurrency` |
-| `REPEATS` | `3` | 每个并发度、每个目标重复次数 |
+| `POD_NAME` | 必填 | 要 benchmark 的已运行 Pod 名称 |
+| `POD_NAMESPACE` | 当前 kubectl namespace，取不到则 `default` | Pod namespace |
+| `CONTAINER_NAME` | 优先 `cuda-container`，否则单容器自动选择 | 要保存日志的容器；多容器 Pod 无法自动判断时必须指定 |
+| `POD_WAIT_TIMEOUT` | `300` | 等待 Pod `Running` 的最大秒数 |
+| `HEALTH_TIMEOUT` | `600` | 等待 `http://<podIP>:<BENCH_PORT>/health` 的最大秒数 |
+| `CONCURRENCY_LEVELS` | `1 2 4 8 16 32 64` | 依次传给 `vllm bench serve --max-concurrency` |
 | `COOLDOWN` | `5` | 每轮 benchmark 后冷却秒数 |
-| `CGROUP_ROOT` | `/sys/fs/cgroup` | cgroup v2 根目录 |
-| `PERF_EVENTS` | task-clock/context-switches/cpu-migrations 等 | 传给 `perf stat -e` 的事件列表；不可用 tracepoint 会自动跳过 |
-| `MIN_THROUGHPUT_GAIN_PCT` | `5` | 判定吞吐提升的最小百分比 |
-| `MIN_SCHED_DROP_PCT` | `10` | 判定单位 token 调度开销下降的最小百分比 |
+| `BENCH_BACKEND` | `openai` | 传给 `vllm bench serve --backend` |
+| `BENCH_PORT` | `8000` | 传给 `--port`，也用于 `/health` 检测 |
+| `BENCH_ENDPOINT` | `/v1/completions` | 传给 `--endpoint` |
+| `BENCH_MODEL` | `/model` | 传给 `--model` |
+| `BENCH_DATASET_NAME` | `random` | 传给 `--dataset-name` |
+| `BENCH_INPUT_LEN` | `1024` | 传给 `--input-len` |
+| `BENCH_OUTPUT_LEN` | `128` | 传给 `--output-len` |
+| `BENCH_NUM_PROMPTS` | `1000` | 传给 `--num-prompts` |
+| `BENCH_REQUEST_RATE` | `inf` | 传给 `--request-rate` |
+| `BENCH_TOKENIZER` | `/home/liulei/models/Qwen/Qwen3___5-9B/` | 非空时传给 `--tokenizer` |
+| `BENCH_NO_PROXY` | `*` | benchmark 命令的 `NO_PROXY/no_proxy`，避免 Pod IP 请求走本机代理 |
 
-`BENCH_BACKEND`、`BENCH_PORT`、`BENCH_ENDPOINT`、`BENCH_MODEL`、`BENCH_DATASET_NAME`、`BENCH_INPUT_LEN`、`BENCH_OUTPUT_LEN`、`BENCH_NUM_PROMPTS`、`BENCH_REQUEST_RATE`、`BENCH_TOKENIZER`、`BENCH_NO_PROXY` 与 `core-test/vllm-bench-multi.sh` 默认值一致，其中 `BENCH_NO_PROXY` 默认为 `*`，避免 Pod IP 请求走本机代理。
+输出目录为 `core-test/perf-logs/pod-bench_<namespace>_<pod>_<timestamp>/`，包含：
 
-输出目录为 `core-test/perf-logs/cpu-pin-sched-verify/<timestamp>/`，包含：
+- `run.log`: 完整脚本日志
+- `timepoints.tsv`: Pod 可见、Running、ready、保存 YAML/log、每轮 benchmark start/end 等时间点
+- `pod.yaml`: benchmark 前的 live Pod YAML
+- `pod_pre_bench.log`: benchmark 前容器日志，用于保留 Pod 启动阶段输出
+- `summary.csv`: 每个并发度的起止时间、耗时、退出码、结果路径
+- `c<N>/vllm_bench.log`: 每个并发度的 benchmark stdout/stderr
+- `c<N>/vllm_bench.json`: 每个并发度的 benchmark JSON
 
-- `verify_cpu_pin_sched_overhead_<timestamp>.log`: 完整运行日志
-- `runs.jsonl`: 每轮 benchmark 的原始指标
-- `summary.csv`: 按 target/concurrency 聚合后的 CSV
-- `summary.md`: baseline 与 pinned 的并发度对比和最终结论
-- 每轮子目录中的 `vllm_bench.json`、`perf_stat.csv`、`cpu.stat.before.txt`、`cpu.stat.after.txt`、`cpuset.cpus.effective.txt`、`cgroup.procs.txt`
+## GPU 间通信测试 Pod
 
-判定逻辑使用 `output_token_throughput` 作为主吞吐指标；调度开销使用 `context-switches / 1k output tokens`、`cpu-migrations / 1k output tokens`、`system_cpu_usec / 1k output tokens`。当吞吐提升达到阈值，并且三个主调度指标中至少两个可用指标达到下降阈值时，`summary.md` 会输出“支持调度开销下降假设”。
+`core-test/gpu-comm-test-kata.yaml` 和 `core-test/gpu-comm-test-runc.yaml` 分别在 Kata 和 runc 中申请 2 张 GPU。Pod 启动后自动执行测试并退出，不启动 vLLM 服务，也不固定 `nodeName`；比较结果时应确认两次调度到同一物理节点。
+
+测试先保存 `nvidia-smi topo -m` 和 P2P capability 矩阵，再用 PyTorch 测量每个有向 GPU 对的 GPU→GPU 拷贝带宽，并通过 NCCL all-reduce 测量两卡集体通信带宽。`pair_results.csv` 中的 `copy_path=direct_p2p` 仅表示 PyTorch 报告对应 GPU 对可用 peer access；`cuda_runtime_fallback` 不应解读为直接 P2P 带宽。
+
+```bash
+# runc
+kubectl apply -f core-test/gpu-comm-test-runc.yaml
+kubectl logs -f gpu-comm-test-runc
+
+# Kata
+kubectl apply -f core-test/gpu-comm-test-kata.yaml
+kubectl logs -f gpu-comm-test-kata
+```
+
+默认参数在两个 YAML 的容器环境变量中定义：`TRANSFER_SIZE_MB=64`、`WARMUP_ITERS=10`、`MEASURE_ITERS=100`、`ALLREDUCE_ITERS=100`。如需修改，请在创建 Pod 前修改相应 YAML；已创建 Pod 的环境变量不可更新。
+
+结果写入宿主机 `/data/home/liulei/TcProject/ctr-container/traces/gpu-comm/<runtime>_<pod>_<UTC 时间戳>/`：
+
+- `run.log`、`metadata.txt`、`gpu_list.txt`、`nvidia-smi.txt`：运行上下文和原始 GPU 信息
+- `topology_raw.txt`、`topology.csv`、`p2p_{p,r,w,a,n}.txt`：链路类型与 P2P capability
+- `device_info.csv`、`pair_results.csv`：可见 GPU 和逐对拷贝带宽
+- `allreduce_results.csv`：NCCL all-reduce 的平均耗时、algorithm bandwidth 和 bus bandwidth
+
+当容器中少于 2 张可见 GPU、PyTorch/NCCL 不可用，或任一测量失败时，Pod 以失败状态结束；相关 CSV 会写入 `status=failed` 和错误原因，供诊断使用。
 
 ## 启动性能测量
 

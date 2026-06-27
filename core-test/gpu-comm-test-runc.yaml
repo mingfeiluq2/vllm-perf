@@ -1,0 +1,454 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-comm-test-runc
+  labels:
+    app: gpu-comm-test
+    runtime: runc
+spec:
+  runtimeClassName: nvidia
+  restartPolicy: Never
+  containers:
+    - name: gpu-comm-test
+      image: docker.io/vllm/vllm-openai:v0.20.1-cu129-ubuntu2404
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: TEST_RUNTIME
+          value: runc
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: TRANSFER_SIZE_MB
+          value: "64"
+        - name: WARMUP_ITERS
+          value: "10"
+        - name: MEASURE_ITERS
+          value: "100"
+        - name: ALLREDUCE_ITERS
+          value: "100"
+        - name: NCCL_DEBUG
+          value: WARN
+      command:
+        - bash
+        - -lc
+        - |
+          set -euo pipefail
+
+          TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
+          RUN_DIR="/traces/gpu-comm/${TEST_RUNTIME}_${POD_NAME}_${TIMESTAMP}"
+          mkdir -p "${RUN_DIR}"
+          exec > >(tee -a "${RUN_DIR}/run.log") 2>&1
+
+          PAIR_RESULTS="${RUN_DIR}/pair_results.csv"
+          ALLREDUCE_RESULTS="${RUN_DIR}/allreduce_results.csv"
+
+          echo "==> GPU communication test"
+          echo "    runtime: ${TEST_RUNTIME}"
+          echo "    pod: ${POD_NAMESPACE}/${POD_NAME}"
+          echo "    node: ${NODE_NAME:-pending}"
+          echo "    output: ${RUN_DIR}"
+          echo "    transfer_size_mb: ${TRANSFER_SIZE_MB}"
+          echo "    warmup_iters: ${WARMUP_ITERS}"
+          echo "    measure_iters: ${MEASURE_ITERS}"
+          echo "    allreduce_iters: ${ALLREDUCE_ITERS}"
+
+          {
+            echo "runtime=${TEST_RUNTIME}"
+            echo "pod=${POD_NAMESPACE}/${POD_NAME}"
+            echo "node=${NODE_NAME:-pending}"
+            echo "timestamp_utc=${TIMESTAMP}"
+            env | grep -E '^(CUDA_VISIBLE_DEVICES|NCCL_|TRANSFER_SIZE_MB|WARMUP_ITERS|MEASURE_ITERS|ALLREDUCE_ITERS)=' | sort || true
+          } > "${RUN_DIR}/metadata.txt"
+
+          nvidia-smi -L > "${RUN_DIR}/gpu_list.txt" 2>&1 || true
+          nvidia-smi > "${RUN_DIR}/nvidia-smi.txt" 2>&1 || true
+          nvidia-smi topo -m > "${RUN_DIR}/topology_raw.txt" 2>&1 || true
+          for capability in p r w a n; do
+            nvidia-smi topo -p2p "${capability}" > "${RUN_DIR}/p2p_${capability}.txt" 2>&1 || true
+          done
+
+          PAIR_FAILED=0
+          if ! command -v python3 >/dev/null 2>&1; then
+            printf 'gpu_index,name,total_memory_bytes,compute_capability,status,error\n' > "${RUN_DIR}/device_info.csv"
+            printf '%s\n' '-1,,, ,failed,python3_not_found' >> "${RUN_DIR}/device_info.csv"
+            printf 'src_gpu,dst_gpu,topology_link,p2p_access,peer_enable_status,copy_path,message_size_bytes,warmup_iters,measure_iters,elapsed_ms,bandwidth_GBps,status,error\n' > "${PAIR_RESULTS}"
+            printf '%s\n' '-1,-1,,false,not_run,not_run,0,0,0,,,,failed,python3_not_found' >> "${PAIR_RESULTS}"
+            PAIR_FAILED=1
+          elif ! python3 - "${RUN_DIR}" <<'PY'
+          import csv
+          import os
+          import re
+          import sys
+          import time
+          from pathlib import Path
+
+          output_dir = Path(sys.argv[1])
+          pair_file = output_dir / "pair_results.csv"
+          device_file = output_dir / "device_info.csv"
+          topology_file = output_dir / "topology.csv"
+          message_bytes = int(os.environ["TRANSFER_SIZE_MB"]) * 1024 * 1024
+          warmup_iters = int(os.environ["WARMUP_ITERS"])
+          measure_iters = int(os.environ["MEASURE_ITERS"])
+
+          pair_fields = [
+              "src_gpu", "dst_gpu", "topology_link", "p2p_access",
+              "peer_enable_status", "copy_path", "message_size_bytes",
+              "warmup_iters", "measure_iters", "elapsed_ms", "bandwidth_GBps",
+              "status", "error",
+          ]
+          device_fields = [
+              "gpu_index", "name", "total_memory_bytes", "compute_capability",
+              "status", "error",
+          ]
+          topology_fields = ["src_gpu", "dst_gpu", "link_type"]
+
+          def write_rows(path, fields, rows):
+              with path.open("w", newline="") as handle:
+                  writer = csv.DictWriter(handle, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def error_text(error):
+              return f"{type(error).__name__}: {str(error).replace(chr(10), ' ')}"
+
+          topology_rows = []
+          topology_map = {}
+          raw_topology = output_dir / "topology_raw.txt"
+          if raw_topology.exists():
+              ansi_escape = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+              clean_lines = [ansi_escape.sub("", line).strip() for line in raw_topology.read_text(errors="replace").splitlines()]
+              header = []
+              for line in clean_lines:
+                  labels = re.findall(r"\bGPU\d+\b", line)
+                  if len(labels) >= 2:
+                      header = labels
+                      break
+              for line in clean_lines:
+                  match = re.match(r"^(GPU\d+)\s+(.*)$", line)
+                  if not match or not header:
+                      continue
+                  source = match.group(1)
+                  tokens = match.group(2).split()
+                  for destination, link_type in zip(header, tokens):
+                      if source != destination:
+                          topology_rows.append({
+                              "src_gpu": source,
+                              "dst_gpu": destination,
+                              "link_type": link_type,
+                          })
+                          topology_map[(source, destination)] = link_type
+          write_rows(topology_file, topology_fields, topology_rows)
+
+          try:
+              import torch
+          except Exception as exc:
+              write_rows(device_file, device_fields, [{
+                  "gpu_index": -1, "name": "", "total_memory_bytes": "",
+                  "compute_capability": "", "status": "failed", "error": error_text(exc),
+              }])
+              write_rows(pair_file, pair_fields, [{
+                  "src_gpu": -1, "dst_gpu": -1, "topology_link": "",
+                  "p2p_access": "false", "peer_enable_status": "not_run",
+                  "copy_path": "not_run", "message_size_bytes": message_bytes,
+                  "warmup_iters": warmup_iters, "measure_iters": measure_iters,
+                  "elapsed_ms": "", "bandwidth_GBps": "", "status": "failed",
+                  "error": error_text(exc),
+              }])
+              sys.exit(1)
+
+          if message_bytes <= 0 or warmup_iters < 0 or measure_iters <= 0:
+              configuration_error = "TRANSFER_SIZE_MB must be > 0, WARMUP_ITERS >= 0, and MEASURE_ITERS > 0"
+              write_rows(device_file, device_fields, [])
+              write_rows(pair_file, pair_fields, [{
+                  "src_gpu": -1, "dst_gpu": -1, "topology_link": "",
+                  "p2p_access": "false", "peer_enable_status": "not_run",
+                  "copy_path": "not_run", "message_size_bytes": message_bytes,
+                  "warmup_iters": warmup_iters, "measure_iters": measure_iters,
+                  "elapsed_ms": "", "bandwidth_GBps": "", "status": "failed",
+                  "error": configuration_error,
+              }])
+              sys.exit(1)
+
+          if not torch.cuda.is_available():
+              unavailable_error = "torch.cuda.is_available() returned false"
+              write_rows(device_file, device_fields, [{
+                  "gpu_index": -1, "name": "", "total_memory_bytes": "",
+                  "compute_capability": "", "status": "failed", "error": unavailable_error,
+              }])
+              write_rows(pair_file, pair_fields, [{
+                  "src_gpu": -1, "dst_gpu": -1, "topology_link": "",
+                  "p2p_access": "false", "peer_enable_status": "not_run",
+                  "copy_path": "not_run", "message_size_bytes": message_bytes,
+                  "warmup_iters": warmup_iters, "measure_iters": measure_iters,
+                  "elapsed_ms": "", "bandwidth_GBps": "", "status": "failed",
+                  "error": unavailable_error,
+              }])
+              sys.exit(1)
+
+          gpu_count = torch.cuda.device_count()
+          device_rows = []
+          for gpu_index in range(gpu_count):
+              try:
+                  properties = torch.cuda.get_device_properties(gpu_index)
+                  device_rows.append({
+                      "gpu_index": gpu_index,
+                      "name": properties.name,
+                      "total_memory_bytes": properties.total_memory,
+                      "compute_capability": f"{properties.major}.{properties.minor}",
+                      "status": "ok",
+                      "error": "",
+                  })
+              except Exception as exc:
+                  device_rows.append({
+                      "gpu_index": gpu_index, "name": "", "total_memory_bytes": "",
+                      "compute_capability": "", "status": "failed", "error": error_text(exc),
+                  })
+          write_rows(device_file, device_fields, device_rows)
+
+          if gpu_count < 2:
+              visible_gpu_error = f"expected at least 2 visible GPUs, found {gpu_count}"
+              write_rows(pair_file, pair_fields, [{
+                  "src_gpu": -1, "dst_gpu": -1, "topology_link": "",
+                  "p2p_access": "false", "peer_enable_status": "not_run",
+                  "copy_path": "not_run", "message_size_bytes": message_bytes,
+                  "warmup_iters": warmup_iters, "measure_iters": measure_iters,
+                  "elapsed_ms": "", "bandwidth_GBps": "", "status": "failed",
+                  "error": visible_gpu_error,
+              }])
+              sys.exit(1)
+
+          def synchronize_devices(*devices):
+              for device in devices:
+                  with torch.cuda.device(device):
+                      torch.cuda.synchronize()
+
+          pair_rows = []
+          failures = 0
+          for source_index in range(gpu_count):
+              for destination_index in range(gpu_count):
+                  if source_index == destination_index:
+                      continue
+                  peer_access = False
+                  peer_enable_status = "not_attempted"
+                  copy_path = "cuda_runtime_fallback"
+                  source_buffer = None
+                  destination_buffer = None
+                  row = {
+                      "src_gpu": source_index,
+                      "dst_gpu": destination_index,
+                      "topology_link": topology_map.get((f"GPU{source_index}", f"GPU{destination_index}"), "unknown"),
+                      "p2p_access": "false",
+                      "peer_enable_status": peer_enable_status,
+                      "copy_path": copy_path,
+                      "message_size_bytes": message_bytes,
+                      "warmup_iters": warmup_iters,
+                      "measure_iters": measure_iters,
+                      "elapsed_ms": "",
+                      "bandwidth_GBps": "",
+                      "status": "failed",
+                      "error": "",
+                  }
+                  try:
+                      peer_access = bool(torch.cuda.can_device_access_peer(source_index, destination_index))
+                      row["p2p_access"] = str(peer_access).lower()
+                      if peer_access:
+                          enable_peer_access = getattr(torch.cuda, "device_enable_peer_access", None)
+                          if enable_peer_access is None:
+                              peer_enable_status = "not_exposed_by_torch"
+                          else:
+                              try:
+                                  enable_peer_access(source_index, destination_index)
+                                  peer_enable_status = "enabled"
+                              except RuntimeError as exc:
+                                  if "already enabled" in str(exc).lower():
+                                      peer_enable_status = "already_enabled"
+                                  else:
+                                      peer_enable_status = f"failed: {error_text(exc)}"
+                          copy_path = "direct_p2p" if not peer_enable_status.startswith("failed") else "cuda_runtime_fallback"
+                      row["peer_enable_status"] = peer_enable_status
+                      row["copy_path"] = copy_path
+
+                      source_buffer = torch.empty(message_bytes, dtype=torch.uint8, device=f"cuda:{source_index}")
+                      destination_buffer = torch.empty(message_bytes, dtype=torch.uint8, device=f"cuda:{destination_index}")
+                      source_buffer.fill_(source_index)
+                      synchronize_devices(source_index, destination_index)
+                      for _ in range(warmup_iters):
+                          destination_buffer.copy_(source_buffer, non_blocking=True)
+                      synchronize_devices(source_index, destination_index)
+                      start = time.perf_counter()
+                      for _ in range(measure_iters):
+                          destination_buffer.copy_(source_buffer, non_blocking=True)
+                      synchronize_devices(source_index, destination_index)
+                      elapsed_seconds = time.perf_counter() - start
+                      row["elapsed_ms"] = f"{elapsed_seconds * 1000:.6f}"
+                      row["bandwidth_GBps"] = f"{(message_bytes * measure_iters) / elapsed_seconds / 1e9:.6f}"
+                      row["status"] = "ok"
+                  except Exception as exc:
+                      failures += 1
+                      row["error"] = error_text(exc)
+                  finally:
+                      del source_buffer
+                      del destination_buffer
+                      torch.cuda.empty_cache()
+                  pair_rows.append(row)
+
+          write_rows(pair_file, pair_fields, pair_rows)
+          sys.exit(1 if failures else 0)
+          PY
+          then
+            PAIR_FAILED=1
+          fi
+
+          ALLREDUCE_FAILED=0
+          if ! command -v torchrun >/dev/null 2>&1; then
+            printf 'world_size,message_size_bytes,warmup_iters,measure_iters,avg_elapsed_ms,algorithm_bandwidth_GBps,bus_bandwidth_GBps,status,error\n' > "${ALLREDUCE_RESULTS}"
+            printf '%s\n' '2,0,0,0,,,,failed,torchrun_not_found' >> "${ALLREDUCE_RESULTS}"
+            ALLREDUCE_FAILED=1
+          else
+            cat > "${RUN_DIR}/allreduce_test.py" <<'PY'
+          import csv
+          import os
+          import sys
+          import time
+          from pathlib import Path
+
+          output_dir = Path(sys.argv[1])
+          output_file = output_dir / "allreduce_results.csv"
+          rank = int(os.environ.get("RANK", "0"))
+          local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+          world_size = int(os.environ.get("WORLD_SIZE", "1"))
+          message_bytes = int(os.environ["TRANSFER_SIZE_MB"]) * 1024 * 1024
+          warmup_iters = int(os.environ["WARMUP_ITERS"])
+          measure_iters = int(os.environ["ALLREDUCE_ITERS"])
+          fields = [
+              "world_size", "message_size_bytes", "warmup_iters", "measure_iters",
+              "avg_elapsed_ms", "algorithm_bandwidth_GBps", "bus_bandwidth_GBps",
+              "status", "error",
+          ]
+
+          def write_result(**values):
+              if rank != 0:
+                  return
+              with output_file.open("w", newline="") as handle:
+                  writer = csv.DictWriter(handle, fieldnames=fields)
+                  writer.writeheader()
+                  writer.writerow(values)
+
+          def error_text(error):
+              return f"{type(error).__name__}: {str(error).replace(chr(10), ' ')}"
+
+          try:
+              import torch
+              import torch.distributed as dist
+          except Exception as exc:
+              write_result(
+                  world_size=world_size, message_size_bytes=message_bytes,
+                  warmup_iters=warmup_iters, measure_iters=measure_iters,
+                  avg_elapsed_ms="", algorithm_bandwidth_GBps="", bus_bandwidth_GBps="",
+                  status="failed", error=error_text(exc),
+              )
+              sys.exit(1)
+
+          initialized = False
+          try:
+              if message_bytes <= 0 or warmup_iters < 0 or measure_iters <= 0:
+                  raise ValueError("TRANSFER_SIZE_MB must be > 0, WARMUP_ITERS >= 0, and ALLREDUCE_ITERS > 0")
+              if not torch.cuda.is_available():
+                  raise RuntimeError("torch.cuda.is_available() returned false")
+              if not dist.is_nccl_available():
+                  raise RuntimeError("PyTorch was built without NCCL support")
+              if torch.cuda.device_count() < world_size:
+                  raise RuntimeError(f"visible GPU count {torch.cuda.device_count()} is smaller than world size {world_size}")
+
+              torch.cuda.set_device(local_rank)
+              dist.init_process_group(backend="nccl")
+              initialized = True
+              element_count = max(1, message_bytes // 4)
+              payload = torch.ones(element_count, dtype=torch.float32, device=f"cuda:{local_rank}")
+              actual_message_bytes = payload.numel() * payload.element_size()
+
+              for _ in range(warmup_iters):
+                  dist.all_reduce(payload)
+              torch.cuda.synchronize(local_rank)
+              dist.barrier()
+
+              start = time.perf_counter()
+              for _ in range(measure_iters):
+                  dist.all_reduce(payload)
+              torch.cuda.synchronize(local_rank)
+              local_elapsed_seconds = time.perf_counter() - start
+
+              elapsed = torch.tensor([local_elapsed_seconds], dtype=torch.float64, device=f"cuda:{local_rank}")
+              dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+              elapsed_seconds = elapsed.item()
+              average_seconds = elapsed_seconds / measure_iters
+              algorithm_bandwidth = actual_message_bytes / average_seconds / 1e9
+              bus_bandwidth = algorithm_bandwidth * (2 * (world_size - 1) / world_size)
+              write_result(
+                  world_size=world_size, message_size_bytes=actual_message_bytes,
+                  warmup_iters=warmup_iters, measure_iters=measure_iters,
+                  avg_elapsed_ms=f"{average_seconds * 1000:.6f}",
+                  algorithm_bandwidth_GBps=f"{algorithm_bandwidth:.6f}",
+                  bus_bandwidth_GBps=f"{bus_bandwidth:.6f}",
+                  status="ok", error="",
+              )
+          except Exception as exc:
+              write_result(
+                  world_size=world_size, message_size_bytes=message_bytes,
+                  warmup_iters=warmup_iters, measure_iters=measure_iters,
+                  avg_elapsed_ms="", algorithm_bandwidth_GBps="", bus_bandwidth_GBps="",
+                  status="failed", error=error_text(exc),
+              )
+              raise
+          finally:
+              if initialized:
+                  import torch.distributed as dist
+                  dist.destroy_process_group()
+          PY
+
+            if ! torchrun --standalone --nproc-per-node=2 "${RUN_DIR}/allreduce_test.py" "${RUN_DIR}"; then
+              ALLREDUCE_FAILED=1
+              if [ ! -s "${ALLREDUCE_RESULTS}" ]; then
+                printf 'world_size,message_size_bytes,warmup_iters,measure_iters,avg_elapsed_ms,algorithm_bandwidth_GBps,bus_bandwidth_GBps,status,error\n' > "${ALLREDUCE_RESULTS}"
+                printf '%s\n' '2,0,0,0,,,,failed,torchrun_failed_before_result_written' >> "${ALLREDUCE_RESULTS}"
+              fi
+            fi
+          fi
+
+          echo "==> Results"
+          find "${RUN_DIR}" -maxdepth 1 -type f -printf '    %f\n' | sort
+          if [ "${PAIR_FAILED}" -ne 0 ] || [ "${ALLREDUCE_FAILED}" -ne 0 ]; then
+            echo "==> GPU communication test failed; inspect ${RUN_DIR}"
+            exit 1
+          fi
+          echo "==> GPU communication test completed successfully"
+      resources:
+        requests:
+          cpu: "4"
+          memory: 8Gi
+          nvidia.com/gpu: "2"
+        limits:
+          cpu: "4"
+          memory: 8Gi
+          nvidia.com/gpu: "2"
+      volumeMounts:
+        - name: trace-volume
+          mountPath: /traces
+  volumes:
+    - name: trace-volume
+      hostPath:
+        path: /data/home/liulei/TcProject/ctr-container/traces
+        type: DirectoryOrCreate
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
